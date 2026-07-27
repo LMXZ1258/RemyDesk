@@ -1,0 +1,4 @@
+Cmnd_Alias REMYDESK_NETWORK = /usr/bin/nmcli *
+Cmnd_Alias REMYDESK_DESKTOP = /usr/bin/systemctl start remydesk-desktop.service, /usr/bin/systemctl stop remydesk-desktop.service
+Cmnd_Alias REMYDESK_POWEROFF = /usr/bin/systemctl --no-ask-password poweroff
+remydesk ALL=(root) NOPASSWD: REMYDESK_NETWORK, REMYDESK_DESKTOP, REMYDESK_POWEROFF

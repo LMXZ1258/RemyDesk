@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101820">
+  <title>RemyDesk</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">RemyDesk</div>
+    <div id="networkBadge" class="status-pill">网络检测中</div>
+    <button class="icon-button" id="refreshButton" title="刷新" aria-label="刷新"><i data-lucide="refresh-cw"></i></button>
+  </header>
+
+  <main class="workspace">
+    <section class="file-toolbar">
+      <button class="icon-button" id="backButton" title="返回上级" aria-label="返回上级"><i data-lucide="arrow-left"></i></button>
+      <div id="breadcrumb" class="breadcrumb">/</div>
+      <button class="command-button" id="mkdirButton"><i data-lucide="folder-plus"></i><span>新建文件夹</span></button>
+      <button class="command-button primary" id="uploadButton"><i data-lucide="upload"></i><span>上传</span></button>
+      <input id="fileInput" type="file" multiple hidden>
+    </section>
+
+    <section id="fileSurface" class="file-surface">
+      <div id="fileHead" class="file-head"><span>名称</span><span>大小</span><span></span></div>
+      <div id="fileList" class="file-list"></div>
+      <div id="emptyState" class="empty-state" hidden>此文件夹为空</div>
+      <div id="desktopHint" class="desktop-hint" hidden>拖动图标任意位置调整 · 拖到文件夹移动</div>
+    </section>
+  </main>
+
+  <nav class="dock" aria-label="设备工具">
+    <button class="dock-button" id="desktopButton"><i data-lucide="monitor-up"></i><span>桌面</span><b id="desktopDot"></b></button>
+    <button class="dock-button" id="wifiButton"><i data-lucide="wifi"></i><span>Wi-Fi</span></button>
+    <button class="dock-button" id="noteButton"><i data-lucide="notebook-pen"></i><span>便签</span></button>
+    <button class="dock-button danger" id="shutdownButton"><i data-lucide="power"></i><span>关机</span></button>
+  </nav>
+
+  <dialog id="previewDialog" class="preview-modal">
+    <div class="preview-head">
+      <div>
+        <strong id="previewTitle">文件预览</strong>
+        <small id="previewMeta"></small>
+      </div>
+      <div>
+        <a id="previewDownload" class="command-button" href="#" download><i data-lucide="download"></i><span>下载</span></a>
+        <button id="previewFullscreen" class="icon-button" title="预览内容全屏" aria-label="预览内容全屏"><i data-lucide="maximize"></i></button>
+        <button class="icon-button close-dialog" aria-label="关闭"><i data-lucide="x"></i></button>
+      </div>
+    </div>
+    <div id="previewBody" class="preview-body"></div>
+  </dialog>
+
+  <dialog id="wifiDialog" class="modal wide-modal">
+    <div class="modal-head"><h2>网络</h2><button class="icon-button close-dialog" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <div class="network-summary">
+      <div><span>当前 Wi-Fi</span><strong id="currentSsid">未连接</strong></div>
+      <div><span>热点</span><strong id="hotspotState">关闭</strong></div>
+    </div>
+    <div class="setting-row">
+      <div><strong>开机启动热点</strong><small id="hotspotAddress"></small></div>
+      <label class="switch"><input id="autoHotspot" type="checkbox"><span></span></label>
+    </div>
+    <div class="action-row">
+      <button id="scanWifi" class="command-button primary"><i data-lucide="scan-search"></i><span>扫描</span></button>
+      <button id="deepScanWifi" class="command-button"><i data-lucide="radar"></i><span>深度扫描</span></button>
+      <button id="toggleHotspot" class="command-button"><i data-lucide="radio-tower"></i><span>打开热点</span></button>
+    </div>
+    <div id="wifiConnectStatus" class="wifi-connect-status" role="status" aria-live="polite">请选择网络并点击右侧“连接”</div>
+    <div id="wifiList" class="wifi-list"></div>
+
+    <div class="section-title">IPv4 地址</div>
+    <div class="ipv4-card">
+      <label class="field"><span>应用到</span><select id="ipv4Connection"></select></label>
+      <div class="segmented ipv4-mode" id="ipv4Mode">
+        <button data-mode="auto" class="active"><i data-lucide="refresh-cw"></i><span>动态获取</span></button>
+        <button data-mode="manual"><i data-lucide="settings-2"></i><span>静态地址</span></button>
+      </div>
+      <p id="ipv4ModeHint" class="ipv4-mode-hint">由路由器自动分配 IP 地址，无需填写其他内容。</p>
+      <div id="manualIpv4" class="ipv4-manual" hidden>
+        <div class="form-grid">
+          <label class="field"><span>IP 地址</span><input id="ipv4Address" inputmode="decimal" placeholder="192.168.1.58"></label>
+          <label class="field"><span>子网掩码</span><input id="ipv4Netmask" inputmode="decimal" placeholder="255.255.255.0"></label>
+        </div>
+        <details class="ipv4-advanced">
+          <summary>高级设置（可选）</summary>
+          <div class="form-grid">
+            <label class="field"><span>网关</span><input id="ipv4Gateway" inputmode="decimal" placeholder="192.168.1.1"></label>
+            <label class="field"><span>DNS</span><input id="ipv4Dns" placeholder="1.1.1.1, 8.8.8.8"></label>
+          </div>
+        </details>
+      </div>
+      <div class="ipv4-actions">
+        <span id="ipv4SaveStatus" class="ipv4-save-status" role="status"></span>
+        <button id="saveIpv4" class="command-button primary"><i data-lucide="check"></i><span>应用动态地址</span></button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="passwordDialog" class="modal compact-modal">
+    <div class="modal-head"><h2 id="passwordTitle">连接 Wi-Fi</h2><button class="icon-button close-dialog" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <label class="field"><span>密码</span><input id="wifiPassword" type="password" autocomplete="current-password"></label>
+    <button id="confirmWifi" class="command-button primary align-right"><i data-lucide="wifi"></i><span>连接</span></button>
+  </dialog>
+
+  <dialog id="noteDialog" class="modal compact-modal">
+    <div class="modal-head"><h2>便签</h2><button class="icon-button close-dialog" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <textarea id="noteText" class="note-text" aria-label="便签内容"></textarea>
+    <div class="note-actions">
+      <button id="copyNote" class="command-button"><i data-lucide="copy"></i><span>一键复制</span></button>
+      <button id="saveNote" class="command-button primary"><i data-lucide="save"></i><span>保存</span></button>
+    </div>
+  </dialog>
+
+  <dialog id="desktopDialog" class="desktop-modal">
+    <div class="desktop-head">
+      <strong>局域网桌面</strong>
+      <div>
+        <span id="desktopStatusText" class="desktop-status-text"></span>
+        <button id="desktopPower" class="command-button"><i data-lucide="power"></i><span>启动</span></button>
+        <button id="desktopFullscreen" class="icon-button" title="本地页面全屏" aria-label="本地页面全屏"><i data-lucide="maximize"></i></button>
+        <button class="icon-button close-dialog" aria-label="关闭"><i data-lucide="x"></i></button>
+      </div>
+    </div>
+    <div id="desktopStage" class="desktop-stage"><div class="desktop-placeholder">桌面投屏默认关闭</div></div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/assets/lucide.min.js"></script>
+  <script src="/assets/jszip.min.js"></script>
+  <script src="/assets/epub.min.js"></script>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

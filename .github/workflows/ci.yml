@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache-dependency-path: native/webrtc-publisher/go.sum
+      - name: Build C++ control plane
+        run: |
+          cmake -S . -B build -DBUILD_TESTING=ON
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+      - name: Test WebRTC publisher
+        working-directory: native/webrtc-publisher
+        run: go test ./...
+      - name: Check shell syntax
+        run: |
+          bash -n scripts/*.sh
+          bash -n native/desktop-streamer/*.sh
+      - name: Check repository hygiene
+        run: |
+          test -f VERSION
+          ! find . -type f \( -name '*.before-*' -o -name '*.key' -o -name '*.pem' \) -print -quit | grep -q .
+

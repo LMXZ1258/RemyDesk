@@ -1,0 +1,14 @@
+/build/
+/build-*/
+/dist/
+/.cache/
+*.log
+*.tmp
+*.swp
+*.before-*
+native/desktop-streamer/drm_fb_probe
+native/desktop-streamer/drm_rga_mpp_stream
+native/desktop-streamer/drm_rga_snapshot
+native/desktop-streamer/drm_rga_mpp_frame
+native/webrtc-publisher/remydesk-webrtc-publisher
+

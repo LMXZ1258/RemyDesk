@@ -1,0 +1,17 @@
+[Unit]
+Description=RemyDesk LAN DRM/KMS WebRTC desktop publisher
+After=graphical.target network.target remydesk-display-mode.service
+Wants=remydesk-display-mode.service
+Conflicts=kms-p2p-publisher.service kms-p2p-publisher-remote.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/remydesk/desktop.env
+WorkingDirectory=/opt/remydesk/libexec
+ExecStart=/opt/remydesk/bin/remydesk-webrtc-publisher
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=8
+KillMode=control-group
+
+# Intentionally no WantedBy entry: desktop streaming is off after installation.

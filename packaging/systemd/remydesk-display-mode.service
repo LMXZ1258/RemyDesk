@@ -1,0 +1,13 @@
+[Unit]
+Description=RemyDesk preferred virtual display mode
+After=display-manager.service graphical.target
+Wants=display-manager.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/remydesk/desktop.env
+ExecStart=/opt/remydesk/libexec/remydesk-display-mode.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=graphical.target

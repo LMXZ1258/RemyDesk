@@ -1,0 +1,23 @@
+[Unit]
+Description=RemyDesk C++ device control plane
+After=network.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=remydesk
+Group=remydesk
+SupplementaryGroups=video render input
+EnvironmentFile=-/etc/remydesk/remydesk.env
+ExecStart=/opt/remydesk/bin/remydeskd
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=remydesk
+StateDirectory=remydesk
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/remydesk /var/lib/remydesk /run/remydesk
+
+[Install]
+WantedBy=multi-user.target

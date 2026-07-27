@@ -1,0 +1,32 @@
+name: 新板卡适配
+description: 提交新的RK3588/RK3588S板卡验证结果
+title: "[Board] "
+labels: [board-support]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: 板卡型号
+    validations:
+      required: true
+  - type: input
+    id: image
+    attributes:
+      label: 系统镜像与内核
+      description: 请附上 uname -a 和 /etc/os-release
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: remydesk-doctor输出
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 实际表现与日志
+    validations:
+      required: true
+
