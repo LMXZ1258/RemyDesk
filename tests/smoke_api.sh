@@ -47,6 +47,8 @@ if [[ "$READY" -ne 1 ]]; then
 fi
 
 curl -fsS "http://127.0.0.1:$PORT/api/health" | grep -q '"ok":true'
+VERSION="$(tr -d '[:space:]' <"$ROOT/VERSION")"
+curl -fsS "http://127.0.0.1:$PORT/api/health" | grep -q "\"version\":\"$VERSION\""
 curl -fsS -X POST -H 'Content-Type: application/json' \
   -d '{"path":"","name":"smoke"}' "http://127.0.0.1:$PORT/api/mkdir" >/dev/null
 printf 'streaming upload\n' | curl -fsS -X POST --data-binary @- \
@@ -63,6 +65,24 @@ curl -fsS "http://127.0.0.1:$PORT/api/desktop/layout" | grep -q '"rx":0.25'
 curl -fsS -X POST -H 'Content-Type: application/json' \
   -d '{"text":"C++ API smoke"}' "http://127.0.0.1:$PORT/api/note" >/dev/null
 curl -fsS "http://127.0.0.1:$PORT/api/note" | grep -q 'C++ API smoke'
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d "{\"url\":\"http://127.0.0.1:$PORT/assets/styles.css\"}" \
+  "http://127.0.0.1:$PORT/api/downloads" >/dev/null
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d "{\"url\":\"http://127.0.0.1:$PORT/assets/app.js\"}" \
+  "http://127.0.0.1:$PORT/api/downloads" >/dev/null
+DOWNLOADS=""
+for _ in $(seq 1 100); do
+  DOWNLOADS="$(curl -fsS "http://127.0.0.1:$PORT/api/downloads")"
+  if python3 -c 'import json,sys; t=json.load(sys.stdin)["tasks"]; raise SystemExit(not (len(t)==2 and all(x["status"]=="completed" for x in t)))' <<<"$DOWNLOADS"; then
+    break
+  fi
+  sleep 0.05
+done
+python3 -c 'import json,sys; t=json.load(sys.stdin)["tasks"]; assert len(t)==2 and all(x["status"]=="completed" for x in t); assert t[1]["started_at"] >= t[0]["finished_at"]' <<<"$DOWNLOADS"
+cmp "$ROOT/web/styles.css" "$BASE/data/styles.css"
+cmp "$ROOT/web/app.js" "$BASE/data/app.js"
 
 code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/api/files?path=../etc")"
 [[ "$code" == "400" ]]

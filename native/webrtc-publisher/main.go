@@ -15,11 +15,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/rtcp"
@@ -27,36 +30,45 @@ import (
 	"github.com/pion/webrtc/v3"
 )
 
-const version = "0.1.0"
+var version = "dev"
 
 type config struct {
-	SignalMode     string
-	LANListen      string
-	LANPassword    string
-	Name           string
-	SourceMode     string
-	H264Command    string
-	H264WorkDir    string
-	FPS            int
-	ICEServers     string
-	ICEUsername    string
-	ICECredential  string
-	FFmpeg         string
-	FFmpegLogLevel string
-	PacketSize     int
-	H264Fmtp       string
-	H264NALQueue   int
-	AudioEnabled   bool
-	AudioBackend   string
-	AudioSource    string
-	AudioBitrate   string
-	AudioQueueSize int
-	PulseServer    string
-	InputEnabled   bool
-	InputWidth     int
-	InputHeight    int
-	ReconnectDelay time.Duration
-	Verbose        bool
+	SignalMode        string
+	LANListen         string
+	LANPassword       string
+	Name              string
+	SourceMode        string
+	H264Command       string
+	H264WorkDir       string
+	H264Transport     string
+	H264ShmDir        string
+	H264VariableFPS   bool
+	FPS               int
+	ICEServers        string
+	ICEUsername       string
+	ICECredential     string
+	FFmpeg            string
+	FFmpegLogLevel    string
+	PacketSize        int
+	H264Fmtp          string
+	H264NALQueue      int
+	H264StatsInterval time.Duration
+	H264AdaptiveRate  bool
+	H264BitrateMin    int
+	H264BitrateMax    int
+	H264BitrateStart  int
+	H264CCInterval    time.Duration
+	AudioEnabled      bool
+	AudioBackend      string
+	AudioSource       string
+	AudioBitrate      string
+	AudioQueueSize    int
+	PulseServer       string
+	InputEnabled      bool
+	InputWidth        int
+	InputHeight       int
+	ReconnectDelay    time.Duration
+	Verbose           bool
 }
 
 type signalMessage struct {
@@ -93,21 +105,24 @@ type lanServer struct {
 }
 
 type session struct {
-	viewerID   string
-	cfg        config
-	track      *webrtc.TrackLocalStaticRTP
-	audioTrack *webrtc.TrackLocalStaticRTP
-	pc         *webrtc.PeerConnection
-	audioUDP   *net.UDPConn
-	cmd        *exec.Cmd
-	audioCmd   *exec.Cmd
-	cancel     context.CancelFunc
-	mediaMu    sync.Mutex
-	mediaOn    bool
-	lastIDRReq time.Time
-	audioMu    sync.Mutex
-	audioOn    bool
-	closeMu    sync.Once
+	viewerID         string
+	cfg              config
+	track            *webrtc.TrackLocalStaticRTP
+	audioTrack       *webrtc.TrackLocalStaticRTP
+	pc               *webrtc.PeerConnection
+	audioUDP         *net.UDPConn
+	cmd              *exec.Cmd
+	audioCmd         *exec.Cmd
+	cancel           context.CancelFunc
+	mediaMu          sync.Mutex
+	mediaOn          bool
+	lastIDRReq       time.Time
+	lastActiveFPSReq time.Time
+	mediaReady       atomic.Bool
+	targetBitrate    atomic.Uint32
+	audioMu          sync.Mutex
+	audioOn          bool
+	closeMu          sync.Once
 }
 
 func main() {
@@ -136,32 +151,41 @@ func main() {
 func readConfig() config {
 	var showVersion bool
 	cfg := config{
-		SignalMode:     getenv("SIGNAL_MODE", "lan"),
-		LANListen:      getenv("LAN_LISTEN", ":8088"),
-		LANPassword:    os.Getenv("LAN_PASSWORD"),
-		Name:           getenv("SIGNAL_NAME", "rk3588-kms"),
-		SourceMode:     getenv("SOURCE_MODE", "command"),
-		H264Command:    getenv("H264_COMMAND", "exec ./portable_h264_stream.sh"),
-		H264WorkDir:    getenv("H264_WORKDIR", "/opt/remydesk/libexec"),
-		FPS:            getenvInt("FPS", 30),
-		ICEServers:     getenv("ICE_SERVERS", ""),
-		ICEUsername:    "",
-		ICECredential:  "",
-		FFmpeg:         getenv("FFMPEG", "ffmpeg"),
-		FFmpegLogLevel: getenv("FFMPEG_LOGLEVEL", "warning"),
-		PacketSize:     getenvInt("RTP_PACKET_SIZE", 1200),
-		H264Fmtp:       getenv("H264_FMTP", "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c028"),
-		H264NALQueue:   getenvInt("H264_NAL_QUEUE", 4),
-		AudioEnabled:   getenvBool("AUDIO_ENABLED", false),
-		AudioBackend:   getenv("AUDIO_BACKEND", "pulse"),
-		AudioSource:    getenv("AUDIO_SOURCE", "auto"),
-		AudioBitrate:   getenv("AUDIO_BITRATE", "128k"),
-		AudioQueueSize: getenvInt("AUDIO_THREAD_QUEUE_SIZE", 8),
-		PulseServer:    getenv("PULSE_SERVER", ""),
-		InputEnabled:   getenvBool("INPUT_ENABLED", true),
-		InputWidth:     getenvInt("INPUT_WIDTH", 1920),
-		InputHeight:    getenvInt("INPUT_HEIGHT", 1080),
-		ReconnectDelay: time.Duration(getenvInt("RECONNECT_SECONDS", 3)) * time.Second,
+		SignalMode:        getenv("SIGNAL_MODE", "lan"),
+		LANListen:         getenv("LAN_LISTEN", ":8088"),
+		LANPassword:       os.Getenv("LAN_PASSWORD"),
+		Name:              getenv("SIGNAL_NAME", "rk3588-kms"),
+		SourceMode:        getenv("SOURCE_MODE", "command"),
+		H264Command:       getenv("H264_COMMAND", "exec ./portable_h264_stream.sh"),
+		H264WorkDir:       getenv("H264_WORKDIR", "/opt/remydesk/libexec"),
+		H264Transport:     strings.ToLower(getenv("H264_TRANSPORT", "stdout")),
+		H264ShmDir:        getenv("H264_SHM_DIR", "/run/remydesk"),
+		H264VariableFPS:   getenvBool("H264_VARIABLE_FPS", getenvBool("REMYDESK_DYNAMIC_FPS", false)),
+		FPS:               getenvInt("FPS", 30),
+		ICEServers:        getenv("ICE_SERVERS", ""),
+		ICEUsername:       "",
+		ICECredential:     "",
+		FFmpeg:            getenv("FFMPEG", "ffmpeg"),
+		FFmpegLogLevel:    getenv("FFMPEG_LOGLEVEL", "warning"),
+		PacketSize:        getenvInt("RTP_PACKET_SIZE", 1200),
+		H264Fmtp:          getenv("H264_FMTP", "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c028"),
+		H264NALQueue:      getenvInt("H264_NAL_QUEUE", 4),
+		H264StatsInterval: time.Duration(getenvInt("H264_STATS_LOG_SECONDS", 30)) * time.Second,
+		H264AdaptiveRate:  getenvBool("H264_ADAPTIVE_BITRATE", false),
+		H264BitrateMin:    getenvInt("H264_BITRATE_MIN", 2000000),
+		H264BitrateMax:    getenvInt("H264_BITRATE_MAX", 8000000),
+		H264BitrateStart:  getenvInt("REMYDESK_VIDEO_BITRATE", 6000000),
+		H264CCInterval:    time.Duration(getenvInt("H264_CC_INTERVAL_MS", 1000)) * time.Millisecond,
+		AudioEnabled:      getenvBool("AUDIO_ENABLED", false),
+		AudioBackend:      getenv("AUDIO_BACKEND", "pulse"),
+		AudioSource:       getenv("AUDIO_SOURCE", "auto"),
+		AudioBitrate:      getenv("AUDIO_BITRATE", "128k"),
+		AudioQueueSize:    getenvInt("AUDIO_THREAD_QUEUE_SIZE", 8),
+		PulseServer:       getenv("PULSE_SERVER", ""),
+		InputEnabled:      getenvBool("INPUT_ENABLED", true),
+		InputWidth:        getenvInt("INPUT_WIDTH", 1920),
+		InputHeight:       getenvInt("INPUT_HEIGHT", 1080),
+		ReconnectDelay:    time.Duration(getenvInt("RECONNECT_SECONDS", 3)) * time.Second,
 	}
 	flag.StringVar(&cfg.SignalMode, "signal-mode", cfg.SignalMode, "signaling mode (RemyDesk v0.1 supports lan only)")
 	flag.StringVar(&cfg.LANListen, "lan-listen", cfg.LANListen, "LAN HTTP listen address for signal-mode=lan")
@@ -170,6 +194,8 @@ func readConfig() config {
 	flag.StringVar(&cfg.SourceMode, "source-mode", cfg.SourceMode, "source mode: command")
 	flag.StringVar(&cfg.H264Command, "h264-command", cfg.H264Command, "command that writes Annex-B H264 to stdout")
 	flag.StringVar(&cfg.H264WorkDir, "h264-workdir", cfg.H264WorkDir, "working directory for h264-command")
+	flag.StringVar(&cfg.H264Transport, "h264-transport", cfg.H264Transport, "Annex-B transport: stdout or shm")
+	flag.StringVar(&cfg.H264ShmDir, "h264-shm-dir", cfg.H264ShmDir, "directory for shared H264 rings")
 	flag.IntVar(&cfg.FPS, "fps", cfg.FPS, "input video frame rate")
 	flag.StringVar(&cfg.ICEServers, "ice-servers", cfg.ICEServers, "comma-separated STUN/TURN URLs")
 	flag.StringVar(&cfg.ICEUsername, "ice-username", cfg.ICEUsername, "TURN username for turn: ICE servers")
@@ -179,6 +205,9 @@ func readConfig() config {
 	flag.IntVar(&cfg.PacketSize, "rtp-packet-size", cfg.PacketSize, "RTP packet size")
 	flag.StringVar(&cfg.H264Fmtp, "h264-fmtp", cfg.H264Fmtp, "H264 SDP fmtp line")
 	flag.IntVar(&cfg.H264NALQueue, "h264-nal-queue", cfg.H264NALQueue, "maximum queued Annex-B NAL units")
+	flag.BoolVar(&cfg.H264AdaptiveRate, "h264-adaptive-bitrate", cfg.H264AdaptiveRate, "adapt native MPP bitrate from RTCP feedback")
+	flag.IntVar(&cfg.H264BitrateMin, "h264-bitrate-min", cfg.H264BitrateMin, "minimum adaptive H264 bitrate")
+	flag.IntVar(&cfg.H264BitrateMax, "h264-bitrate-max", cfg.H264BitrateMax, "maximum adaptive H264 bitrate")
 	flag.BoolVar(&cfg.AudioEnabled, "audio-enabled", cfg.AudioEnabled, "enable optional Opus audio publishing")
 	flag.StringVar(&cfg.AudioBackend, "audio-backend", cfg.AudioBackend, "ffmpeg audio input backend: pulse or alsa")
 	flag.StringVar(&cfg.AudioSource, "audio-source", cfg.AudioSource, "ffmpeg audio input source")
@@ -203,10 +232,38 @@ func readConfig() config {
 		fmt.Fprintln(os.Stderr, "RemyDesk v0.1 only supports direct Annex-B command input")
 		os.Exit(2)
 	}
+	cfg.H264Transport = strings.ToLower(strings.TrimSpace(cfg.H264Transport))
+	if cfg.H264Transport != "stdout" && cfg.H264Transport != "shm" {
+		fmt.Fprintln(os.Stderr, "H264_TRANSPORT must be stdout or shm")
+		os.Exit(2)
+	}
 	if cfg.H264NALQueue < 2 {
 		cfg.H264NALQueue = 2
 	} else if cfg.H264NALQueue > 64 {
 		cfg.H264NALQueue = 64
+	}
+	if cfg.H264BitrateMin < 100000 {
+		cfg.H264BitrateMin = 100000
+	}
+	if cfg.H264BitrateMax > 200000000 {
+		cfg.H264BitrateMax = 200000000
+	}
+	if cfg.H264BitrateMax < cfg.H264BitrateMin {
+		cfg.H264BitrateMax = cfg.H264BitrateMin
+	}
+	if cfg.H264BitrateStart < cfg.H264BitrateMin {
+		cfg.H264BitrateStart = cfg.H264BitrateMin
+	} else if cfg.H264BitrateStart > cfg.H264BitrateMax {
+		cfg.H264BitrateStart = cfg.H264BitrateMax
+	}
+	if cfg.H264CCInterval < 250*time.Millisecond {
+		cfg.H264CCInterval = 250 * time.Millisecond
+	} else if cfg.H264CCInterval > 5*time.Second {
+		cfg.H264CCInterval = 5 * time.Second
+	}
+	if cfg.H264AdaptiveRate && cfg.H264Transport != "shm" {
+		fmt.Fprintln(os.Stderr, "H264_ADAPTIVE_BITRATE requires H264_TRANSPORT=shm; disabling")
+		cfg.H264AdaptiveRate = false
 	}
 	if cfg.AudioQueueSize < 8 {
 		cfg.AudioQueueSize = 8
@@ -278,6 +335,9 @@ func createPeerSession(
 
 	ctx, cancel := context.WithCancel(parent)
 	s := &session{viewerID: viewerID, cfg: cfg, pc: pc, cancel: cancel}
+	if cfg.H264AdaptiveRate {
+		s.targetBitrate.Store(uint32(cfg.H264BitrateStart))
+	}
 	storeSession(viewerID, s)
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -320,6 +380,7 @@ func createPeerSession(
 				}
 				return
 			}
+			s.requestActiveFPS()
 			if input == nil {
 				return
 			}
@@ -560,6 +621,11 @@ func (s *lanServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	viewerID := "lan-" + randomID(8)
+	// A websocket owns at most one peer session.  Tear it down as soon as the
+	// signaling connection disappears instead of waiting for WebRTC's state
+	// machine to time out; otherwise a browser reconnect can briefly be rejected
+	// as "desktop already in use".
+	defer s.closeSession(viewerID)
 
 	var writeMu sync.Mutex
 	send := func(v any) error {
@@ -749,7 +815,8 @@ button:active { transform:translateY(1px); }
 .badge { display:inline-flex; align-items:center; min-height:34px; padding:3px 8px; border-radius:999px; background:#223045; color:var(--muted); font-size:12px; white-space:nowrap; }
 .badge.active { background:rgba(34,197,94,.18); color:var(--ok); }
 .badge.failed { background:rgba(239,68,68,.18); color:var(--bad); }
-#statsPanel { position:fixed; left:12px; bottom:12px; z-index:9; min-width:190px; max-width:calc(100vw - 24px); padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:rgba(12,17,23,.72); color:#d7dee8; font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; white-space:pre; pointer-events:none; backdrop-filter:blur(8px); }
+#statsPanel { display:none; position:fixed; left:12px; bottom:12px; z-index:9; min-width:190px; max-width:calc(100vw - 24px); padding:8px 10px; border:1px solid rgba(248,113,113,.55); border-radius:8px; background:rgba(69,10,10,.82); color:#fecaca; font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; white-space:pre; pointer-events:none; backdrop-filter:blur(8px); }
+#statsPanel.visible { display:block; }
 #lock { position:fixed; inset:0; z-index:50; display:none; align-items:center; justify-content:center; padding:20px; background:rgba(0,0,0,.72); }
 #lock.active { display:flex; }
 .pin { width:min(360px,100%); padding:18px; border:1px solid #344255; border-radius:8px; background:#111820; box-shadow:0 20px 60px rgba(0,0,0,.36); }
@@ -787,7 +854,7 @@ button:active { transform:translateY(1px); }
   </div>
   <textarea id="keyboardInput" class="keyboardInput" rows="2" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="在这里输入或粘贴，内容会发送到设备"></textarea>
 </div>
-<div id="statsPanel">stats: waiting</div>
+<div id="statsPanel" role="status" aria-live="polite"></div>
 <div id="lock">
   <div class="pin">
     <label for="pinInput">PIN</label>
@@ -808,6 +875,11 @@ button:active { transform:translateY(1px); }
   var keepalive = 0;
   var controlIdleTimer = 0;
   var statsTimer = 0;
+  var statsAlertTimer = 0;
+  var reconnectTimer = 0;
+  var reconnectAttempt = 0;
+  var connectionGeneration = 0;
+  var unloading = false;
   var inputEnabled = false;
   var audioOn = false;
   var lastMove = 0;
@@ -821,6 +893,10 @@ button:active { transform:translateY(1px); }
   var wheelRemainder = 0;
   var lastStatsFrames = 0;
   var lastStatsTime = 0;
+  var lastJitterBufferDelay = 0;
+  var lastJitterBufferCount = 0;
+  var lastStatsDropped = 0;
+  var lastStatsLost = 0;
   var video = document.getElementById("video");
   var audio = document.getElementById("audio");
   var controls = document.getElementById("controls");
@@ -847,8 +923,9 @@ button:active { transform:translateY(1px); }
     inputState.classList.toggle("active", !bad && (text.indexOf("ready") !== -1 || text.indexOf("active") !== -1 || text.indexOf("connected") !== -1));
     inputState.classList.toggle("failed", !!bad);
   }
-  function setStatsText(text) {
+  function setStatsText(text, visible) {
     statsPanel.textContent = text;
+    statsPanel.classList.toggle("visible", !!visible);
   }
   function send(obj) {
     if (dc && dc.readyState === "open") dc.send(JSON.stringify(obj));
@@ -958,14 +1035,30 @@ button:active { transform:translateY(1px); }
     });
     if (h264.length) transceiver.setCodecPreferences(h264);
   }
+  function preferLowLatency(receiver) {
+    if (!receiver) return;
+    try {
+      if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
+    } catch (e) {}
+    try {
+      if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0;
+    } catch (e) {}
+  }
   function stopStats() {
     if (statsTimer) clearInterval(statsTimer);
     statsTimer = 0;
+    if (statsAlertTimer) clearTimeout(statsAlertTimer);
+    statsAlertTimer = 0;
+    setStatsText("", false);
   }
   function startStats() {
     stopStats();
     lastStatsFrames = 0;
     lastStatsTime = performance.now();
+    lastJitterBufferDelay = 0;
+    lastJitterBufferCount = 0;
+    lastStatsDropped = 0;
+    lastStatsLost = 0;
     statsTimer = setInterval(async function () {
       if (!pc) return;
       try {
@@ -987,26 +1080,51 @@ button:active { transform:translateY(1px); }
             var now = performance.now();
             var frames = item.framesDecoded || 0;
             var fps = 0;
+            var jitterMs = null;
             if (lastStatsTime > 0) {
               fps = Math.max(0, Math.round((frames - lastStatsFrames) * 1000 / Math.max(1, now - lastStatsTime)));
             }
+            if (typeof item.jitterBufferDelay === "number" &&
+                typeof item.jitterBufferEmittedCount === "number" &&
+                item.jitterBufferEmittedCount > lastJitterBufferCount) {
+              jitterMs = Math.round(
+                (item.jitterBufferDelay - lastJitterBufferDelay) * 1000 /
+                (item.jitterBufferEmittedCount - lastJitterBufferCount)
+              );
+              lastJitterBufferDelay = item.jitterBufferDelay;
+              lastJitterBufferCount = item.jitterBufferEmittedCount;
+            }
             lastStatsFrames = frames;
             lastStatsTime = now;
+            var dropped = Math.max(0, item.framesDropped || 0);
+            var lost = Math.max(0, item.packetsLost || 0);
+            var droppedDelta = Math.max(0, dropped - lastStatsDropped);
+            var lostDelta = Math.max(0, lost - lastStatsLost);
+            lastStatsDropped = dropped;
+            lastStatsLost = lost;
             window.__kmsStats = {
               packets: item.packetsReceived || 0,
               frames: frames,
-              dropped: item.framesDropped || 0,
-              lost: item.packetsLost || 0
+              dropped: dropped,
+              lost: lost
             };
-            setStatsText(
-              "fps: " + fps + "\n" +
-              "packets: " + (item.packetsReceived || 0) + "\n" +
-              "frames: " + frames + "\n" +
-              "dropped: " + (item.framesDropped || 0) + "\n" +
-              "lost: " + (item.packetsLost || 0) + "\n" +
-              "rtt: " + (rtt === null ? "?" : rtt + " ms") + "\n" +
-              "pair: " + (localType || "?") + " -> " + (remoteType || "?")
-            );
+            if (droppedDelta > 0 || lostDelta > 0) {
+              setStatsText(
+                "stream loss detected\n" +
+                "fps: " + fps + "\n" +
+                "dropped: " + dropped + " (+" + droppedDelta + ")\n" +
+                "lost: " + lost + " (+" + lostDelta + ")\n" +
+                "jitter: " + (jitterMs === null ? "?" : jitterMs + " ms") + "\n" +
+                "rtt: " + (rtt === null ? "?" : rtt + " ms") + "\n" +
+                "pair: " + (localType || "?") + " -> " + (remoteType || "?"),
+                true
+              );
+              if (statsAlertTimer) clearTimeout(statsAlertTimer);
+              statsAlertTimer = setTimeout(function () {
+                statsAlertTimer = 0;
+                setStatsText("", false);
+              }, 5000);
+            }
           }
         });
       } catch (e) {}
@@ -1036,7 +1154,10 @@ button:active { transform:translateY(1px); }
       setStatus(inputReady() ? "input: ready" : "input: waiting", !inputReady());
     }
   }
-  function closePeer() {
+  function closePeer(cancelReconnect) {
+    connectionGeneration++;
+    if (cancelReconnect !== false && reconnectTimer) clearTimeout(reconnectTimer);
+    if (cancelReconnect !== false) reconnectTimer = 0;
     stopStats();
     setInputEnabled(false);
     if (keepalive) clearInterval(keepalive);
@@ -1047,10 +1168,25 @@ button:active { transform:translateY(1px); }
     remoteStream = null;
     video.srcObject = null;
     audio.srcObject = null;
-    setStatsText("stats: waiting");
+    setStatsText("", false);
+  }
+  function scheduleReconnect(reason, generation) {
+    if (unloading || generation !== connectionGeneration || reconnectTimer) return;
+    closePeer(false);
+    var delay = Math.min(5000, 500 * Math.pow(2, Math.min(reconnectAttempt, 4)));
+    reconnectAttempt++;
+    setStatus((reason || "connection lost") + "; retrying in " + (delay / 1000) + "s", true);
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = 0;
+      connect();
+    }, delay);
   }
   async function connect() {
-    closePeer();
+    if (unloading) return;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = 0;
+    closePeer(false);
+    var generation = connectionGeneration;
     setStatus("connecting");
     audioOn = false;
     pendingRemoteCandidates = [];
@@ -1059,19 +1195,25 @@ button:active { transform:translateY(1px); }
       var wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
       ws = new WebSocket(wsScheme + "//" + location.host + "/ws?password=" + encodeURIComponent(password));
       pc = new RTCPeerConnection({ iceServers: [] });
-      preferH264(pc.addTransceiver("video", { direction: "recvonly" }));
+      var videoTransceiver = pc.addTransceiver("video", { direction: "recvonly" });
+      preferH264(videoTransceiver);
+      preferLowLatency(videoTransceiver.receiver);
       if (cfg.audioEnabled) pc.addTransceiver("audio", { direction: "recvonly" });
       dc = pc.createDataChannel("input", { ordered: true });
       dc.onopen = function () {
+        if (generation !== connectionGeneration) return;
+        reconnectAttempt = 0;
         setStatus("input: ready");
         scheduleControlAutoHide();
         keepalive = setInterval(function () { send({ type: "keepalive" }); }, 5000);
       };
       dc.onclose = function () {
+        if (generation !== connectionGeneration) return;
         setInputEnabled(false);
         setStatus("input: closed", true);
       };
       pc.ontrack = function (event) {
+        preferLowLatency(event.receiver);
         // Keep audio and video in one HTMLMediaElement. Separate <video> and
         // <audio> elements have independent playback clocks and gradually
         // drift apart when the encoder or network drops a frame.
@@ -1090,10 +1232,15 @@ button:active { transform:translateY(1px); }
         video.play().catch(function () {});
       };
       pc.onconnectionstatechange = function () {
-        if (pc.connectionState === "failed" || pc.connectionState === "closed") setStatus("connection: " + pc.connectionState, true);
+        if (generation !== connectionGeneration) return;
+        if (pc.connectionState === "failed" || pc.connectionState === "disconnected" || pc.connectionState === "closed") {
+          scheduleReconnect("connection: " + pc.connectionState, generation);
+        }
       };
       pc.oniceconnectionstatechange = function () {
+        if (generation !== connectionGeneration) return;
         if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+          reconnectAttempt = 0;
           setStatus("input: connected");
           startStats();
         }
@@ -1102,16 +1249,17 @@ button:active { transform:translateY(1px); }
         if (event.candidate && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "candidate", candidate: event.candidate.toJSON() }));
       };
       ws.onopen = async function () {
+        if (generation !== connectionGeneration) return;
         try {
           var offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
           ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription }));
         } catch (err) {
-          closePeer();
-          setStatus(err.message || String(err), true);
+          scheduleReconnect(err.message || String(err), generation);
         }
       };
       ws.onmessage = async function (event) {
+        if (generation !== connectionGeneration) return;
         try {
           var msg = JSON.parse(event.data);
           if (msg.type === "answer" && msg.sdp) {
@@ -1130,25 +1278,18 @@ button:active { transform:translateY(1px); }
             return;
           }
           if (msg.type === "error") {
-            closePeer();
-            setStatus(msg.error || "signaling error", true);
+            scheduleReconnect(msg.error || "signaling error", generation);
           }
         } catch (err) {
           setStatus(err.message || String(err), true);
         }
       };
       ws.onclose = function () {
-        if (pc && pc.connectionState !== "connected" && pc.connectionState !== "closed") setStatus("signaling closed", true);
+        scheduleReconnect("signaling closed", generation);
       };
-      ws.onerror = function () { setStatus("signaling error", true); };
+      ws.onerror = function () { scheduleReconnect("signaling error", generation); };
     } catch (err) {
-      closePeer();
-      setStatus(err.message || String(err), true);
-      if (cfg.passwordEnabled) {
-        lock.classList.add("active");
-        pinInput.value = "";
-        pinInput.focus();
-      }
+      scheduleReconnect(err.message || String(err), generation);
     }
   }
   function normFromEvent(event) {
@@ -1282,6 +1423,7 @@ button:active { transform:translateY(1px); }
   });
   window.addEventListener("blur", function () { send({ type: "all_up" }); });
   window.addEventListener("beforeunload", function () {
+    unloading = true;
     send({ type: "all_up" });
     closePeer();
   });
@@ -1367,6 +1509,19 @@ func drainRTCP(sender *webrtc.RTPSender) {
 
 func (s *session) drainVideoRTCP(sender *webrtc.RTPSender) {
 	buf := make([]byte, 1500)
+	var controller *congestionController
+	if s.cfg.H264AdaptiveRate {
+		controller = newCongestionController(
+			s.cfg.H264BitrateMin,
+			s.cfg.H264BitrateMax,
+			s.cfg.H264BitrateStart,
+			s.cfg.H264CCInterval,
+			time.Now(),
+		)
+		log.Printf("viewer=%s adaptive bitrate enabled min=%d start=%d max=%d interval=%s",
+			s.viewerID, s.cfg.H264BitrateMin, s.cfg.H264BitrateStart,
+			s.cfg.H264BitrateMax, s.cfg.H264CCInterval)
+	}
 	for {
 		n, _, err := sender.Read(buf)
 		if err != nil {
@@ -1376,23 +1531,92 @@ func (s *session) drainVideoRTCP(sender *webrtc.RTPSender) {
 		if err != nil {
 			continue
 		}
+		now := time.Now()
 		for _, pkt := range packets {
-			switch pkt.(type) {
+			switch packet := pkt.(type) {
 			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
 				s.requestIDR()
+			case *rtcp.ReceiverReport:
+				if controller != nil {
+					for _, report := range packet.Reports {
+						controller.observeReceiverReport(report, now)
+					}
+				}
+			case *rtcp.TransportLayerNack:
+				if controller != nil {
+					controller.observeNACK(packet)
+				}
+			case *rtcp.ReceiverEstimatedMaximumBitrate:
+				if controller != nil {
+					controller.observeREMB(packet, now)
+				}
+			}
+		}
+		if controller != nil {
+			target, changed, metrics, evaluated := controller.maybeUpdate(now)
+			if changed {
+				s.targetBitrate.Store(uint32(target))
+				rttMS := int64(-1)
+				if metrics.HasRTT {
+					rttMS = metrics.RTT.Milliseconds()
+				}
+				log.Printf("viewer=%s congestion bitrate=%d reason=%s loss=%.1f%% nacks=%d rtt_ms=%d remb=%d",
+					s.viewerID, target, metrics.Reason, metrics.Loss*100,
+					metrics.NACKs, rttMS, metrics.REMB)
+			} else if evaluated && s.cfg.Verbose {
+				log.Printf("viewer=%s congestion stable bitrate=%d loss=%.1f%% nacks=%d",
+					s.viewerID, target, metrics.Loss*100, metrics.NACKs)
 			}
 		}
 	}
 }
 
 func (s *session) requestIDR() {
-	// The RK3588 encoder is configured with a one-second GOP, so a fresh IDR
-	// arrives naturally. Some vendor MPP builds emit a broken sequence after
-	// MPP_ENC_SET_IDR_FRAME while streaming; forwarding PLI/FIR as SIGUSR1 then
-	// freezes browser decoding even though RTP packets continue. Let the regular
-	// GOP recover instead of disrupting a healthy stream.
-	if s.cfg.Verbose {
-		log.Printf("viewer=%s PLI/FIR received; waiting for periodic IDR", s.viewerID)
+	// The RK3399 vendor MPP uses a long GOP because automatic GOP-boundary IDRs
+	// are unreliable in this BSP. Its explicit MPP_ENC_SET_IDR_FRAME path is
+	// stable, though, and drm_hotplug_stream.sh forwards SIGUSR1 to the encoder.
+	// Rate-limit feedback bursts so repeated PLI/FIR packets do not turn every
+	// frame into an IDR.
+	if !s.mediaReady.Load() {
+		return
+	}
+	s.mediaMu.Lock()
+	if time.Since(s.lastIDRReq) < time.Second {
+		s.mediaMu.Unlock()
+		return
+	}
+	cmd := s.cmd
+	if cmd == nil || cmd.Process == nil {
+		s.mediaMu.Unlock()
+		return
+	}
+	s.lastIDRReq = time.Now()
+	process := cmd.Process
+	s.mediaMu.Unlock()
+
+	if err := process.Signal(syscall.SIGUSR1); err != nil {
+		if !errors.Is(err, os.ErrProcessDone) {
+			log.Printf("viewer=%s PLI/FIR IDR request failed: %v", s.viewerID, err)
+		}
+		return
+	}
+	log.Printf("viewer=%s PLI/FIR requested encoder IDR", s.viewerID)
+}
+
+func (s *session) requestActiveFPS() {
+	if !s.mediaReady.Load() {
+		return
+	}
+	s.mediaMu.Lock()
+	if time.Since(s.lastActiveFPSReq) < 100*time.Millisecond || s.cmd == nil || s.cmd.Process == nil {
+		s.mediaMu.Unlock()
+		return
+	}
+	s.lastActiveFPSReq = time.Now()
+	process := s.cmd.Process
+	s.mediaMu.Unlock()
+	if err := process.Signal(syscall.SIGUSR2); err != nil && !errors.Is(err, os.ErrProcessDone) && s.cfg.Verbose {
+		log.Printf("viewer=%s active FPS request failed: %v", s.viewerID, err)
 	}
 }
 
@@ -1637,14 +1861,28 @@ func (s *session) startAnnexBCommandForwarder(ctx context.Context) error {
 		return errors.New("H264_COMMAND is empty")
 	}
 
+	s.mediaReady.Store(false)
 	cmd := exec.CommandContext(ctx, "sh", "-c", s.cfg.H264Command)
 	configureCommandGroupCancellation(cmd)
 	if strings.TrimSpace(s.cfg.H264WorkDir) != "" {
 		cmd.Dir = s.cfg.H264WorkDir
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
+	var stdout io.ReadCloser
+	var ringPath string
+	if s.cfg.H264Transport == "shm" {
+		if err := os.MkdirAll(s.cfg.H264ShmDir, 0750); err != nil {
+			return fmt.Errorf("create H264 shared-memory directory: %w", err)
+		}
+		ringPath = filepath.Join(s.cfg.H264ShmDir,
+			fmt.Sprintf("h264-%s-%s.ring", s.viewerID, randomID(4)))
+		cmd.Env = append(os.Environ(), "REMYDESK_H264_SHM="+ringPath)
+		cmd.Stdout = io.Discard
+	} else {
+		var err error
+		stdout, err = cmd.StdoutPipe()
+		if err != nil {
+			return err
+		}
 	}
 	cmd.Stderr = os.Stderr
 	s.cmd = cmd
@@ -1652,15 +1890,22 @@ func (s *session) startAnnexBCommandForwarder(ctx context.Context) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	log.Printf("viewer=%s h264 command pid=%d mode=annexb", s.viewerID, cmd.Process.Pid)
+	log.Printf("viewer=%s h264 command pid=%d mode=annexb transport=%s", s.viewerID, cmd.Process.Pid, s.cfg.H264Transport)
 
+	cmdDone := make(chan struct{})
 	go func() {
+		defer close(cmdDone)
 		err := cmd.Wait()
+		s.mediaReady.Store(false)
 		if err != nil && ctx.Err() == nil {
 			log.Printf("viewer=%s h264 command exited: %v", s.viewerID, err)
 		}
 	}()
-	go s.forwardAnnexB(ctx, stdout)
+	if s.cfg.H264Transport == "shm" {
+		go s.forwardSharedAnnexB(ctx, ringPath, cmdDone)
+	} else {
+		go s.forwardAnnexB(ctx, stdout)
+	}
 	return nil
 }
 
@@ -1693,8 +1938,23 @@ func (s *session) forwardAnnexB(ctx context.Context, r io.Reader) {
 			log.Printf("viewer=%s annexb reader stopped: %v", s.viewerID, err)
 		}
 	}()
+	s.forwardAnnexBNALs(ctx, nals)
+}
 
-	writer := newH264RTPWriter(s.track, s.cfg.PacketSize, s.cfg.FPS)
+func (s *session) forwardSharedAnnexB(ctx context.Context, path string, cmdDone <-chan struct{}) {
+	nals := make(chan []byte, s.cfg.H264NALQueue)
+	go func() {
+		defer close(nals)
+		defer os.Remove(path)
+		if err := s.readSharedAnnexBNALs(ctx, path, cmdDone, nals); err != nil && ctx.Err() == nil {
+			log.Printf("viewer=%s shared Annex-B reader stopped: %v", s.viewerID, err)
+		}
+	}()
+	s.forwardAnnexBNALs(ctx, nals)
+}
+
+func (s *session) forwardAnnexBNALs(ctx context.Context, nals <-chan []byte) {
+	writer := newH264RTPWriter(s.track, s.cfg.PacketSize, s.cfg.FPS, s.cfg.H264VariableFPS)
 	var au [][]byte
 	hasVCL := false
 	var startupSPS []byte
@@ -1704,6 +1964,7 @@ func (s *session) forwardAnnexB(ctx context.Context, r io.Reader) {
 	var accessUnits uint64
 	var nalUnits uint64
 	lastLog := time.Now()
+	defer func() { releaseNALBuffers(au) }()
 
 	flush := func() {
 		if len(au) == 0 {
@@ -1715,11 +1976,12 @@ func (s *session) forwardAnnexB(ctx context.Context, r io.Reader) {
 		} else {
 			accessUnits++
 			nalUnits += uint64(nalCount)
-			if time.Since(lastLog) >= 5*time.Second {
+			if s.cfg.H264StatsInterval > 0 && time.Since(lastLog) >= s.cfg.H264StatsInterval {
 				log.Printf("viewer=%s h264 forwarded access_units=%d nals=%d", s.viewerID, accessUnits, nalUnits)
 				lastLog = time.Now()
 			}
 		}
+		releaseNALBuffers(au)
 		au = nil
 		hasVCL = false
 	}
@@ -1734,45 +1996,51 @@ func (s *session) forwardAnnexB(ctx context.Context, r io.Reader) {
 				return
 			}
 			if len(nal) == 0 {
+				releaseNALBuffer(nal)
 				continue
 			}
 			nalType := nal[0] & 0x1f
 			if nalType == 9 || nalType == 12 {
+				releaseNALBuffer(nal)
 				continue
 			}
 
 			// The vendor MPP build can occasionally corrupt the first output
 			// packet while its internal hardware buffers are warming up.  The
 			// packet then contains hundreds of repeated or over-sized parameter
-			// sets, and Chromium never obtains a decodable first frame.  Cache
-			// only plausible SPS/PPS NALs and begin RTP output at the first clean
-			// IDR.  Later parameter sets are intentionally ignored because the
-			// encoder configuration is fixed for the lifetime of the session.
+			// sets, and Chromium never obtains a decodable first frame. Cache only
+			// plausible SPS/PPS NALs and begin RTP output at the first clean IDR.
+			// Keep later valid parameter sets so a PLI-triggered IDR can resend
+			// them and recover a decoder whose reference chain was damaged.
 			if nalType == 7 {
-				if !startupReady && len(nal) <= 256 {
+				if len(nal) <= 256 {
 					startupSPS = append(startupSPS[:0], nal...)
 				} else if !startupReady {
 					startupDropped++
 				}
+				releaseNALBuffer(nal)
 				continue
 			}
 			if nalType == 8 {
-				if !startupReady && len(nal) <= 128 {
+				if len(nal) <= 128 {
 					startupPPS = append(startupPPS[:0], nal...)
 				} else if !startupReady {
 					startupDropped++
 				}
+				releaseNALBuffer(nal)
 				continue
 			}
 			isVCL := nalType >= 1 && nalType <= 5
 			if !startupReady {
 				if nalType != 5 || len(startupSPS) == 0 || len(startupPPS) == 0 {
 					startupDropped++
+					releaseNALBuffer(nal)
 					continue
 				}
-				au = append(au, startupSPS, startupPPS, nal)
+				au = append(au, cloneNAL(startupSPS), cloneNAL(startupPPS), nal)
 				hasVCL = true
 				startupReady = true
+				s.mediaReady.Store(true)
 				log.Printf("viewer=%s h264 startup synchronized dropped_nals=%d sps=%d pps=%d", s.viewerID, startupDropped, len(startupSPS), len(startupPPS))
 				continue
 			}
@@ -1782,12 +2050,173 @@ func (s *session) forwardAnnexB(ctx context.Context, r io.Reader) {
 			if isVCL && hasVCL {
 				flush()
 			}
+			if nalType == 5 && len(startupSPS) > 0 && len(startupPPS) > 0 {
+				au = append(au, cloneNAL(startupSPS), cloneNAL(startupPPS))
+			}
 			if isVCL {
 				hasVCL = true
 			}
 			au = append(au, nal)
 		}
 	}
+}
+
+const (
+	sharedRingMagic      = uint32(0x52444832)
+	sharedRingVersion    = uint32(3)
+	sharedRingHeaderSize = 64
+	sharedSlotHeaderSize = 8
+)
+
+func (s *session) readSharedAnnexBNALs(ctx context.Context, path string, cmdDone <-chan struct{}, out chan<- []byte) error {
+	var previous os.FileInfo
+	for {
+		file, mapped, info, err := openSharedRing(ctx, path, cmdDone, previous)
+		if err != nil {
+			return err
+		}
+		previous = info
+		err = s.consumeSharedRing(ctx, path, file, mapped, info, cmdDone, out)
+		_ = syscall.Munmap(mapped)
+		_ = file.Close()
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-cmdDone:
+			return nil
+		default:
+			// The hotplug wrapper is still alive and will create a new ring inode.
+		}
+	}
+}
+
+func openSharedRing(ctx context.Context, path string, cmdDone <-chan struct{}, previous os.FileInfo) (*os.File, []byte, os.FileInfo, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err == nil {
+			info, statErr := file.Stat()
+			if statErr == nil && (previous == nil || !os.SameFile(previous, info)) && info.Size() >= sharedRingHeaderSize {
+				mapped, mapErr := syscall.Mmap(int(file.Fd()), 0, int(info.Size()), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+				if mapErr == nil {
+					if binary.LittleEndian.Uint32(mapped[0:4]) == sharedRingMagic &&
+						binary.LittleEndian.Uint32(mapped[4:8]) == sharedRingVersion {
+						return file, mapped, info, nil
+					}
+					_ = syscall.Munmap(mapped)
+				}
+			}
+			_ = file.Close()
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		case <-cmdDone:
+			return nil, nil, nil, io.EOF
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *session) consumeSharedRing(ctx context.Context, path string, file *os.File, mapped []byte, info os.FileInfo, cmdDone <-chan struct{}, out chan<- []byte) error {
+	slotCount := binary.LittleEndian.Uint32(mapped[8:12])
+	slotSize := binary.LittleEndian.Uint32(mapped[12:16])
+	if slotCount == 0 || slotCount > 64 || slotSize == 0 || slotSize > 16*1024*1024 {
+		return errors.New("invalid shared H264 ring geometry")
+	}
+	expected := sharedRingHeaderSize + int(slotCount)*(sharedSlotHeaderSize+int(slotSize))
+	if expected > len(mapped) {
+		return errors.New("truncated shared H264 ring")
+	}
+	writeSeq := (*uint64)(unsafe.Pointer(&mapped[16]))
+	readSeq := (*uint64)(unsafe.Pointer(&mapped[24]))
+	closed := (*uint32)(unsafe.Pointer(&mapped[32]))
+	notifySeq := (*uint32)(unsafe.Pointer(&mapped[36]))
+	requestedBitrate := (*uint32)(unsafe.Pointer(&mapped[40]))
+	lastPublishedBitrate := atomic.LoadUint32(requestedBitrate)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-cmdDone:
+			return nil
+		default:
+		}
+		if desired := s.targetBitrate.Load(); desired > 0 && desired != lastPublishedBitrate {
+			atomic.StoreUint32(requestedBitrate, desired)
+			lastPublishedBitrate = desired
+		}
+		read := atomic.LoadUint64(readSeq)
+		write := atomic.LoadUint64(writeSeq)
+		if read < write {
+			offset := sharedRingHeaderSize + int(read%uint64(slotCount))*(sharedSlotHeaderSize+int(slotSize))
+			length := int(binary.LittleEndian.Uint32(mapped[offset : offset+4]))
+			if length < 0 || length > int(slotSize) {
+				return errors.New("invalid shared H264 slot length")
+			}
+			buf := mapped[offset+sharedSlotHeaderSize : offset+sharedSlotHeaderSize+length]
+			for len(buf) > 0 {
+				nal, rest := popAnnexBNAL(buf, true)
+				buf = rest
+				if nal == nil {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					return nil
+				case out <- nal:
+				}
+			}
+			atomic.StoreUint64(readSeq, read+1)
+			continue
+		}
+		if atomic.LoadUint32(closed) != 0 {
+			return nil
+		}
+		notify := atomic.LoadUint32(notifySeq)
+		// Close the race between observing an empty ring and entering FUTEX_WAIT.
+		// If the producer publishes in this window, either write_seq changes or
+		// the futex value mismatch makes the kernel return EAGAIN immediately.
+		if atomic.LoadUint64(writeSeq) != read || atomic.LoadUint32(closed) != 0 {
+			continue
+		}
+		errno := waitSharedRingFutex(notifySeq, notify, 100*time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-cmdDone:
+			return nil
+		default:
+		}
+		if errno == syscall.ETIMEDOUT || errno == syscall.ENOSYS || errno == syscall.EINVAL {
+			current, err := os.Stat(path)
+			if err == nil && !os.SameFile(info, current) {
+				return nil
+			}
+		}
+	}
+}
+
+func waitSharedRingFutex(address *uint32, expected uint32, timeout time.Duration) syscall.Errno {
+	deadline := syscall.NsecToTimespec(timeout.Nanoseconds())
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_FUTEX,
+		uintptr(unsafe.Pointer(address)),
+		0, // FUTEX_WAIT; shared mappings must not use FUTEX_PRIVATE_FLAG.
+		uintptr(expected),
+		uintptr(unsafe.Pointer(&deadline)),
+		0,
+		0,
+	)
+	if errno == syscall.ENOSYS || errno == syscall.EINVAL {
+		time.Sleep(2 * time.Millisecond)
+	}
+	return errno
 }
 
 func readAnnexBNALs(ctx context.Context, r io.Reader, out chan<- []byte) error {
@@ -1883,25 +2312,74 @@ func trimNAL(nal []byte) []byte {
 	if len(nal) == 0 {
 		return nil
 	}
-	out := make([]byte, len(nal))
+	out := acquireNALBuffer(len(nal))
 	copy(out, nal)
 	return out
 }
 
-type h264RTPWriter struct {
-	track       *webrtc.TrackLocalStaticRTP
-	payloadType uint8
-	sequence    uint16
-	timestamp   uint32
-	baseTS      uint32
-	lastTS      uint32
-	startedAt   time.Time
-	frameTicks  uint32
-	ssrc        uint32
-	mtu         int
+var nalBufferPools = [...]struct {
+	capacity int
+	pool     sync.Pool
+}{
+	{capacity: 256},
+	{capacity: 4 * 1024},
+	{capacity: 16 * 1024},
+	{capacity: 64 * 1024},
+	{capacity: 256 * 1024},
 }
 
-func newH264RTPWriter(track *webrtc.TrackLocalStaticRTP, mtu int, fps int) *h264RTPWriter {
+func acquireNALBuffer(size int) []byte {
+	for i := range nalBufferPools {
+		if size > nalBufferPools[i].capacity {
+			continue
+		}
+		if pooled := nalBufferPools[i].pool.Get(); pooled != nil {
+			return pooled.([]byte)[:size]
+		}
+		return make([]byte, size, nalBufferPools[i].capacity)
+	}
+	return make([]byte, size)
+}
+
+func cloneNAL(nal []byte) []byte {
+	clone := acquireNALBuffer(len(nal))
+	copy(clone, nal)
+	return clone
+}
+
+func releaseNALBuffer(buffer []byte) {
+	for i := range nalBufferPools {
+		if cap(buffer) == nalBufferPools[i].capacity {
+			nalBufferPools[i].pool.Put(buffer[:cap(buffer)])
+			return
+		}
+	}
+}
+
+func releaseNALBuffers(buffers [][]byte) {
+	for _, buffer := range buffers {
+		releaseNALBuffer(buffer)
+	}
+}
+
+type h264RTPWriter struct {
+	track        *webrtc.TrackLocalStaticRTP
+	payloadType  uint8
+	sequence     uint16
+	timestamp    uint32
+	baseTS       uint32
+	lastTS       uint32
+	startedAt    time.Time
+	lastFrameAt  time.Time
+	frameTicks   uint32
+	variableFPS  bool
+	ssrc         uint32
+	mtu          int
+	packet       rtp.Packet
+	fragmentPool sync.Pool
+}
+
+func newH264RTPWriter(track *webrtc.TrackLocalStaticRTP, mtu int, fps int, variableFPS ...bool) *h264RTPWriter {
 	if mtu < 256 {
 		mtu = 1200
 	}
@@ -1913,7 +2391,8 @@ func newH264RTPWriter(track *webrtc.TrackLocalStaticRTP, mtu int, fps int) *h264
 		frameTicks = 1
 	}
 	initialTS := randomUint32()
-	return &h264RTPWriter{
+	useVariableFPS := len(variableFPS) > 0 && variableFPS[0]
+	writer := &h264RTPWriter{
 		track:       track,
 		payloadType: 96,
 		sequence:    randomUint16(),
@@ -1921,9 +2400,13 @@ func newH264RTPWriter(track *webrtc.TrackLocalStaticRTP, mtu int, fps int) *h264
 		baseTS:      initialTS,
 		lastTS:      initialTS,
 		frameTicks:  frameTicks,
+		variableFPS: useVariableFPS,
 		ssrc:        randomUint32(),
 		mtu:         mtu,
 	}
+	fragmentCapacity := mtu + 2
+	writer.fragmentPool.New = func() any { return make([]byte, fragmentCapacity) }
+	return writer
 }
 
 func (w *h264RTPWriter) writeAccessUnit(nals [][]byte) error {
@@ -1933,7 +2416,18 @@ func (w *h264RTPWriter) writeAccessUnit(nals [][]byte) error {
 	now := time.Now()
 	if w.startedAt.IsZero() {
 		w.startedAt = now
+		w.lastFrameAt = now
 		w.timestamp = w.baseTS
+	} else if w.variableFPS {
+		delta := now.Sub(w.lastFrameAt)
+		ticks := uint32(delta.Nanoseconds() * 90000 / int64(time.Second))
+		if ticks < 1 {
+			ticks = 1
+		} else if ticks > 90000 {
+			ticks = 90000
+		}
+		w.timestamp = w.lastTS + ticks
+		w.lastFrameAt = now
 	} else {
 		// The encoder pipe can be read in bursts even though DRM capture is paced
 		// by vblank. Wall-clock timestamps therefore produce one large jump and
@@ -1983,11 +2477,14 @@ func (w *h264RTPWriter) writeNAL(nal []byte, marker bool) error {
 		if last {
 			endBit = 0x40
 		}
-		fragment := make([]byte, 2+end-offset)
+		fragmentBuffer := w.fragmentPool.Get().([]byte)
+		fragment := fragmentBuffer[:2+end-offset]
 		fragment[0] = fuIndicator
 		fragment[1] = startBit | endBit | nalType
 		copy(fragment[2:], payload[offset:end])
-		if err := w.writePacket(fragment, marker && last); err != nil {
+		err := w.writePacket(fragment, marker && last)
+		w.fragmentPool.Put(fragmentBuffer)
+		if err != nil {
 			return err
 		}
 		offset = end
@@ -1996,7 +2493,7 @@ func (w *h264RTPWriter) writeNAL(nal []byte, marker bool) error {
 }
 
 func (w *h264RTPWriter) writePacket(payload []byte, marker bool) error {
-	pkt := &rtp.Packet{
+	w.packet = rtp.Packet{
 		Header: rtp.Header{
 			Version:        2,
 			PayloadType:    w.payloadType,
@@ -2008,7 +2505,7 @@ func (w *h264RTPWriter) writePacket(payload []byte, marker bool) error {
 		Payload: payload,
 	}
 	w.sequence++
-	return w.track.WriteRTP(pkt)
+	return w.track.WriteRTP(&w.packet)
 }
 
 func randomUint16() uint16 {
@@ -2029,6 +2526,7 @@ func randomUint32() uint32 {
 
 func (s *session) Close() {
 	s.closeMu.Do(func() {
+		s.mediaReady.Store(false)
 		if s.cancel != nil {
 			s.cancel()
 		}

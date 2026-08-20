@@ -16,6 +16,7 @@ IDENTITY="${IDENTITY,,}"
 
 case "$IDENTITY" in
   *orange*pi*5*plus*) PROFILE=orangepi-5-plus ;;
+  *aio-3399j*|*firefly*rk3399*) PROFILE=firefly-rk3399 ;;
   *firefly*rk3588*|*roc-rk3588*|*itx-3588*) PROFILE=firefly-rk3588 ;;
   *) PROFILE=generic-rk3588 ;;
 esac
@@ -25,4 +26,3 @@ if [[ "${1:-}" == "--explain" ]]; then
 else
   printf '%s\n' "$PROFILE"
 fi
-

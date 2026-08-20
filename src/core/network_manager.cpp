@@ -156,7 +156,7 @@ std::string NetworkManager::currentSsid() const {
 
 std::string NetworkManager::hotspotSsid() const {
     std::string host(256, '\0');
-    if (gethostname(host.data(), host.size()) != 0) host = "rk3588";
+    if (gethostname(host.data(), host.size()) != 0) host = "remydesk";
     host.resize(host.find('\0'));
     host = std::regex_replace(host, std::regex("[^A-Za-z0-9_.-]+"), "-");
     std::string value = config_.hotspotPrefix + (host.empty() ? "" : "-" + host.substr(0, 12));

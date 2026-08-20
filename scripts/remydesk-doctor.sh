@@ -33,7 +33,7 @@ if [[ -r /etc/remydesk/profile ]]; then
 elif [[ -x /opt/remydesk/libexec/detect-profile.sh ]]; then
   printf '[INFO] detected profile: %s\n' "$(/opt/remydesk/libexec/detect-profile.sh)"
 fi
-check "RK3588 device tree" grep -Eqi 'rk3588' /proc/device-tree/compatible
+check "supported Rockchip device tree" grep -Eqi 'rk(3399|3588)' /proc/device-tree/compatible
 check "NetworkManager nmcli" command -v nmcli
 check "DRM device" has_drm_card
 check "uinput device" test -e /dev/uinput

@@ -37,9 +37,16 @@ request_idr() {
   fi
 }
 
+request_activity() {
+  if [[ -n "$child_pid" ]]; then
+    kill -USR2 "$child_pid" 2>/dev/null || true
+  fi
+}
+
 trap cleanup EXIT
 trap 'cleanup; exit 0' INT TERM
 trap request_idr USR1
+trap request_activity USR2
 
 has_active_hdmi_fb() {
   if [[ "$CARD" == "auto" || ! -e "$CARD" ]]; then

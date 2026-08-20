@@ -1,4 +1,4 @@
-# RK3588 Ubuntu 移植与兼容策略
+# Rockchip Ubuntu 移植与兼容策略
 
 ## 已消除的机器绑定
 
@@ -11,7 +11,7 @@
 
 ## 仍需满足的硬件条件
 
-不同 RK3588 镜像并不保证媒体栈 ABI 完全相同。目标系统至少需要：
+不同 Rockchip BSP 镜像并不保证媒体栈 ABI 完全相同。目标系统至少需要：
 
 - 可用的 DRM/KMS framebuffer
 - `libdrm` headers/runtime
@@ -40,6 +40,12 @@ sudo ~/Desktop/RemyDesk/scripts/remydesk-doctor.sh --video
 7. 先验证文件和 Wi-Fi API，再从页面启动桌面推流。
 8. 查看 `journalctl -u remydesk-desktop.service -f`，日志会明确打印 capture、conversion 和 encoder。
 
+## RK3399 基线
+
+Firefly AIO-3399J 使用 `firefly-rk3399` 配置。RK3399 的 CPU/GPU 和内存带宽低于
+RK3588，因此默认输出为 1280×720、30fps、3Mbps；确认 BSP 的 DRM/RGA/MPP 链路稳定后，
+可再提高到 1920×1080。官方统一固件仍需由 BSP 提供匹配的媒体库和 GStreamer MPP 插件。
+
 ## 后端移植原则
 
 - `auto` 优先使用稳定的 `ffmpeg-gstreamer-mpp`，在不同厂商的 RK3588 BSP 上只依赖标准 raw NV12 边界。
@@ -50,6 +56,14 @@ sudo ~/Desktop/RemyDesk/scripts/remydesk-doctor.sh --video
 - `REMYDESK_MPP_USER` 默认是 `remydesk`，目标镜像应确保该用户属于 `video`、`render` 组。
 - HDMI 诱骗器常把 4K 放在首选模式；`remydesk-display-mode.service` 会按输出名称自动发现并固定到
   `HDMI_REQUIRED_MODE=1920x1080`，不绑定 `HDMI-1` 或 `HDMI-2`。
+- Firefly AIO-3399J 的 Rockchip 4.4 BSP 可在无显示器、无 HDMI 诱骗器时向
+  `/sys/class/drm/card*-HDMI-A-*/status` 写入 `on`，由内核建立可供 Xorg 和 DRM 采集的扫描输出。
+  `firefly-rk3399` 配置默认启用 `REMYDESK_DRM_FORCE_CONNECTOR=1`；其他板卡保持关闭，避免假定
+  它们也实现了这一非通用 sysfs 接口。
+- AIO-3399J 镜像把内部 API 1.7.0 的旧 librga 与 RGA2 驱动组合在一起，直接执行
+  `XRGB8888 -> NV12` DMA-BUF 转换会返回 `EINVAL`。`firefly-rk3399` 使用应用私有、SHA-256
+  固定的 Rockchip librga 1.10.0 兼容运行库；它只通过 `LD_LIBRARY_PATH` 注入 RemyDesk 服务，
+  不替换系统 librga。该组合已实测连续完成 1280×720@30 的 DRM→RGA→MPP 零 CPU 拷贝编码。
 - 默认推流和输入坐标均为 1920×1080。低带宽场景可以显式设置
   `REMYDESK_VIDEO_WIDTH=1280`、`REMYDESK_VIDEO_HEIGHT=720`，正常局域网不应默认降到 720p。
 - 文件拖入、站内移动和布局持久化只依赖 HTTP/HTML5，不依赖 RK3588 厂商媒体栈，因此在不同 RK3588

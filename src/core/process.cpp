@@ -20,7 +20,8 @@ std::string trim(std::string value) {
 }
 
 CommandResult runCommand(const std::vector<std::string> &arguments,
-                         std::chrono::milliseconds timeout) {
+                         std::chrono::milliseconds timeout,
+                         const std::atomic_bool *cancel) {
     if (arguments.empty()) throw std::invalid_argument("empty command");
 
     int pipeFd[2];
@@ -64,8 +65,9 @@ CommandResult runCommand(const std::vector<std::string> &arguments,
             childDone = waited == pid;
         }
 
-        if (!childDone && std::chrono::steady_clock::now() >= deadline) {
-            result.timedOut = true;
+        if (!childDone && (std::chrono::steady_clock::now() >= deadline ||
+                           (cancel && cancel->load()))) {
+            result.timedOut = std::chrono::steady_clock::now() >= deadline;
             kill(pid, SIGTERM);
             usleep(100000);
             if (waitpid(pid, &status, WNOHANG) == 0) kill(pid, SIGKILL);
@@ -99,4 +101,3 @@ CommandResult runCommand(const std::vector<std::string> &arguments,
 }
 
 }  // namespace remydesk
-

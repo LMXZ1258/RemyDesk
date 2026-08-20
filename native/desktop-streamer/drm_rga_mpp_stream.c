@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <signal.h>
+#include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +16,8 @@
 #include <unistd.h>
 
 #include <linux/dma-buf.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
 
 #include <drm.h>
 #include <drm_fourcc.h>
@@ -21,13 +25,65 @@
 #include <xf86drmMode.h>
 
 #include <rga/im2d.h>
-#include <rga/im2d_mpi.h>
+#include <rga/RgaApi.h>
 #include <rga/rga.h>
+
+#ifndef REMYDESK_RGA_LEGACY_API
+#define REMYDESK_RGA_LEGACY_API 0
+#endif
+
+#if defined(__has_include)
+#  if __has_include(<rga/im2d_mpi.h>) && !REMYDESK_RGA_LEGACY_API
+#    include <rga/im2d_mpi.h>
+#    define REMYDESK_RGA_HANDLE_API 1
+#  endif
+#endif
+#ifndef REMYDESK_RGA_HANDLE_API
+#define REMYDESK_RGA_HANDLE_API 0
+#endif
 
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/mpp_frame.h>
 #include <rockchip/mpp_packet.h>
 #include <rockchip/rk_mpi.h>
+
+#define REMYDESK_RING_MAGIC 0x52444832U
+#define REMYDESK_RING_VERSION 3U
+#define REMYDESK_RING_SLOTS 8U
+#define REMYDESK_RING_SLOT_SIZE (2U * 1024U * 1024U)
+#define REMYDESK_RING_HEADER_SIZE 64U
+#define REMYDESK_RING_SLOT_HEADER_SIZE 8U
+
+struct remydesk_ring_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t slot_count;
+    uint32_t slot_size;
+    _Atomic uint64_t write_seq;
+    _Atomic uint64_t read_seq;
+    _Atomic uint32_t closed;
+    _Atomic uint32_t notify_seq;
+    _Atomic uint32_t requested_bitrate;
+    _Atomic uint32_t applied_bitrate;
+    uint8_t reserved[16];
+};
+
+_Static_assert(sizeof(struct remydesk_ring_header) == REMYDESK_RING_HEADER_SIZE,
+               "shared ring header must remain ABI-stable");
+
+struct stream_writer {
+    int fd;
+    int ring_fd;
+    void *ring_map;
+    size_t ring_map_size;
+    struct remydesk_ring_header *ring;
+};
+
+#if REMYDESK_RGA_HANDLE_API
+typedef rga_buffer_handle_t remydesk_rga_handle_t;
+#else
+typedef int remydesk_rga_handle_t;
+#endif
 
 struct capture_fb {
     uint32_t fb_id;
@@ -53,7 +109,7 @@ struct src_import {
     size_t map_size;
     int rga_format;
     int wstride;
-    rga_buffer_handle_t rga_handle;
+    remydesk_rga_handle_t rga_handle;
     rga_buffer_t rga_buffer;
 };
 
@@ -82,7 +138,7 @@ struct cursor_import {
     int dma_fd;
     int rga_format;
     int wstride;
-    rga_buffer_handle_t rga_handle;
+    remydesk_rga_handle_t rga_handle;
     rga_buffer_t rga_buffer;
 };
 
@@ -96,19 +152,68 @@ struct dumb_rgb_buffer {
     void *map;
     int rga_format;
     int wstride;
-    rga_buffer_handle_t rga_handle;
+    remydesk_rga_handle_t rga_handle;
     rga_buffer_t rga_buffer;
 };
 
 struct encode_buffer {
     MppBuffer mpp_buf;
     int dma_fd;
-    rga_buffer_handle_t rga_handle;
+    remydesk_rga_handle_t rga_handle;
     rga_buffer_t rga_buffer;
 };
 
 static volatile sig_atomic_t stop_requested;
 static volatile sig_atomic_t force_idr_requested;
+static volatile sig_atomic_t activity_requested;
+
+static int wrap_rga_dma_fd(int dma_fd,
+                           int width, int height,
+                           int wstride, int hstride,
+                           int format,
+                           remydesk_rga_handle_t *handle,
+                           rga_buffer_t *buffer)
+{
+#if REMYDESK_RGA_HANDLE_API
+    im_handle_param_t param = {
+        .width = (uint32_t)wstride,
+        .height = (uint32_t)hstride,
+        .format = (uint32_t)format,
+    };
+    *handle = importbuffer_fd(dma_fd, &param);
+    if (!*handle) {
+        return -1;
+    }
+    *buffer = wrapbuffer_handle(*handle, width, height, format, wstride, hstride);
+#else
+    /*
+     * Do not call wrapbuffer_fd_t here.  Firefly packages the old 1.7 headers
+     * while RemyDesk uses a private, fixed librga at runtime; rga_buffer_t grew
+     * in later releases and returning it by value would corrupt the caller's
+     * stack.  The legacy blit path only needs this stable common prefix.
+     */
+    memset(buffer, 0, sizeof(*buffer));
+    buffer->fd = dma_fd;
+    buffer->width = width;
+    buffer->height = height;
+    buffer->wstride = wstride;
+    buffer->hstride = hstride;
+    buffer->format = format;
+    *handle = dma_fd + 1;
+#endif
+    return 0;
+}
+
+static void release_rga_handle(remydesk_rga_handle_t handle)
+{
+#if REMYDESK_RGA_HANDLE_API
+    if (handle) {
+        releasebuffer_handle(handle);
+    }
+#else
+    (void)handle;
+#endif
+}
 
 static void on_signal(int signo)
 {
@@ -120,6 +225,12 @@ static void on_idr_signal(int signo)
 {
     (void)signo;
     force_idr_requested = 1;
+}
+
+static void on_activity_signal(int signo)
+{
+    (void)signo;
+    activity_requested = 1;
 }
 
 static void fourcc_to_string(uint32_t fourcc, char out[5])
@@ -163,6 +274,64 @@ static int bytes_per_pixel_for_drm(uint32_t fourcc)
     default:
         return 0;
     }
+}
+
+static uint32_t legacy_fourcc_for_fb(const drmModeFB *fb)
+{
+    if (fb->bpp == 32 && fb->depth == 32) return DRM_FORMAT_ARGB8888;
+    if (fb->bpp == 32) return DRM_FORMAT_XRGB8888;
+    if (fb->bpp == 24) return DRM_FORMAT_RGB888;
+    return 0;
+}
+
+static int get_capture_fb(int fd, uint32_t fb_id, struct capture_fb *out)
+{
+    /* Linux 4.4 Rockchip BSPs do not implement GETFB2. Remember that result
+     * instead of issuing one guaranteed-to-fail ioctl for every frame. */
+    static int try_fb2 = 1;
+    drmModeFB2Ptr fb2 = try_fb2 ? drmModeGetFB2(fd, fb_id) : NULL;
+    if (fb2) {
+        if (!fb2->handles[0]) {
+            fprintf(stderr, "active fb %u has no GEM handle; run as root or DRM master\n", fb_id);
+            drmModeFreeFB2(fb2);
+            return -1;
+        }
+        memset(out, 0, sizeof(*out));
+        out->fb_id = fb2->fb_id;
+        out->width = fb2->width;
+        out->height = fb2->height;
+        out->fourcc = fb2->pixel_format;
+        out->pitch = fb2->pitches[0];
+        out->modifier = fb2->modifier;
+        out->handle = fb2->handles[0];
+        drmModeFreeFB2(fb2);
+        return 0;
+    }
+    try_fb2 = 0;
+
+    /* Linux 4.4 Rockchip BSPs do not implement DRM_IOCTL_MODE_GETFB2. */
+    drmModeFBPtr fb = drmModeGetFB(fd, fb_id);
+    if (!fb) {
+        fprintf(stderr, "drmModeGetFB(%u) fallback failed: %s\n", fb_id, strerror(errno));
+        return -1;
+    }
+    uint32_t fourcc = legacy_fourcc_for_fb(fb);
+    if (!fb->handle || !fourcc) {
+        fprintf(stderr, "legacy fb %u is not exportable or has unsupported bpp=%u depth=%u\n",
+                fb_id, fb->bpp, fb->depth);
+        drmModeFreeFB(fb);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->fb_id = fb->fb_id;
+    out->width = fb->width;
+    out->height = fb->height;
+    out->fourcc = fourcc;
+    out->pitch = fb->pitch;
+    out->modifier = DRM_FORMAT_MOD_INVALID;
+    out->handle = fb->handle;
+    drmModeFreeFB(fb);
+    return 0;
 }
 
 static drmModeEncoder *find_encoder_for_connector(int fd, drmModeConnector *conn)
@@ -228,36 +397,37 @@ static int find_connected_display_fb(int fd, struct capture_fb *out)
         return -1;
     }
 
-    drmModeFB2Ptr fb = drmModeGetFB2(fd, crtc->buffer_id);
-    if (!fb) {
-        fprintf(stderr, "drmModeGetFB2(%u) failed: %s\n", crtc->buffer_id, strerror(errno));
+    struct capture_fb fb;
+    if (get_capture_fb(fd, crtc->buffer_id, &fb) != 0) {
         drmModeFreeCrtc(crtc);
         drmModeFreeResources(res);
         return -1;
     }
 
-    if (!fb->handles[0]) {
-        fprintf(stderr, "active fb %u has no GEM handle; run as root or DRM master\n", fb->fb_id);
-        drmModeFreeFB2(fb);
-        drmModeFreeCrtc(crtc);
-        drmModeFreeResources(res);
-        return -1;
-    }
-
-    memset(out, 0, sizeof(*out));
-    out->fb_id = fb->fb_id;
-    out->width = fb->width;
-    out->height = fb->height;
-    out->fourcc = fb->pixel_format;
-    out->pitch = fb->pitches[0];
-    out->modifier = fb->modifier;
-    out->handle = fb->handles[0];
+    *out = fb;
     out->crtc_id = crtc_id;
 
-    drmModeFreeFB2(fb);
     drmModeFreeCrtc(crtc);
     drmModeFreeResources(res);
     return 0;
+}
+
+static int get_crtc_capture_fb(int fd, uint32_t crtc_id, struct capture_fb *out)
+{
+    drmModeCrtc *crtc = drmModeGetCrtc(fd, crtc_id);
+    if (!crtc || !crtc->buffer_id) {
+        if (crtc) {
+            drmModeFreeCrtc(crtc);
+        }
+        return -1;
+    }
+
+    int ret = get_capture_fb(fd, crtc->buffer_id, out);
+    drmModeFreeCrtc(crtc);
+    if (ret == 0) {
+        out->crtc_id = crtc_id;
+    }
+    return ret;
 }
 
 static int crtc_index_for_id(int fd, uint32_t crtc_id)
@@ -278,9 +448,8 @@ static int crtc_index_for_id(int fd, uint32_t crtc_id)
     return index;
 }
 
-static int wait_for_crtc_vblank(int fd, uint32_t crtc_id)
+static int wait_for_crtc_vblank(int fd, int crtc_index)
 {
-    int crtc_index = crtc_index_for_id(fd, crtc_id);
     if (crtc_index < 0) {
         return -1;
     }
@@ -362,19 +531,16 @@ static int find_cursor_plane(int fd, uint32_t crtc_id, struct cursor_state *out)
             continue;
         }
 
-        drmModeFB2Ptr fb = drmModeGetFB2(fd, plane->fb_id);
-        if (!fb || !fb->handles[0]) {
-            if (fb) {
-                drmModeFreeFB2(fb);
-            }
+        struct capture_fb fb;
+        if (get_capture_fb(fd, plane->fb_id, &fb) != 0) {
             drmModeFreePlane(plane);
             continue;
         }
 
         uint64_t crtc_x = 0;
         uint64_t crtc_y = 0;
-        uint64_t crtc_w = fb->width;
-        uint64_t crtc_h = fb->height;
+        uint64_t crtc_w = fb.width;
+        uint64_t crtc_h = fb.height;
         get_plane_property_u64(fd, plane->plane_id, "CRTC_X", &crtc_x);
         get_plane_property_u64(fd, plane->plane_id, "CRTC_Y", &crtc_y);
         get_plane_property_u64(fd, plane->plane_id, "CRTC_W", &crtc_w);
@@ -382,18 +548,17 @@ static int find_cursor_plane(int fd, uint32_t crtc_id, struct cursor_state *out)
 
         out->active = 1;
         out->plane_id = plane->plane_id;
-        out->fb_id = fb->fb_id;
-        out->width = fb->width;
-        out->height = fb->height;
-        out->fourcc = fb->pixel_format;
-        out->pitch = fb->pitches[0];
-        out->handle = fb->handles[0];
+        out->fb_id = fb.fb_id;
+        out->width = fb.width;
+        out->height = fb.height;
+        out->fourcc = fb.fourcc;
+        out->pitch = fb.pitch;
+        out->handle = fb.handle;
         out->x = (int32_t)drm_prop_to_s32(crtc_x);
         out->y = (int32_t)drm_prop_to_s32(crtc_y);
-        out->w = crtc_w ? (int32_t)crtc_w : (int32_t)fb->width;
-        out->h = crtc_h ? (int32_t)crtc_h : (int32_t)fb->height;
+        out->w = crtc_w ? (int32_t)crtc_w : (int32_t)fb.width;
+        out->h = crtc_h ? (int32_t)crtc_h : (int32_t)fb.height;
 
-        drmModeFreeFB2(fb);
         drmModeFreePlane(plane);
         drmModeFreePlaneResources(planes);
         return 0;
@@ -454,9 +619,7 @@ static void warn_active_overlay_planes(int fd, uint32_t crtc_id, uint32_t primar
 
 static void release_src_import(struct src_import *src)
 {
-    if (src->rga_handle) {
-        releasebuffer_handle(src->rga_handle);
-    }
+    release_rga_handle(src->rga_handle);
     if (src->map && src->map != MAP_FAILED) {
         munmap(src->map, src->map_size);
     }
@@ -501,14 +664,11 @@ static int ensure_src_import(int drm_fd, struct src_import *src,
     }
 
     int wstride = (int)(cap->pitch / (uint32_t)bytes_per_pixel);
-    im_handle_param_t src_param = {
-        .width = (uint32_t)wstride,
-        .height = cap->height,
-        .format = (uint32_t)rga_format,
-    };
-
-    rga_buffer_handle_t rga_handle = importbuffer_fd(dma_fd, &src_param);
-    if (!rga_handle) {
+    remydesk_rga_handle_t rga_handle = 0;
+    rga_buffer_t rga_buffer = {0};
+    if (wrap_rga_dma_fd(dma_fd, (int)cap->width, (int)cap->height,
+                        wstride, (int)cap->height, rga_format,
+                        &rga_handle, &rga_buffer) != 0) {
         fprintf(stderr, "RGA source import failed for fb=%u fd=%d\n", cap->fb_id, dma_fd);
         close(dma_fd);
         return -1;
@@ -527,8 +687,7 @@ static int ensure_src_import(int drm_fd, struct src_import *src,
     src->rga_format = rga_format;
     src->wstride = wstride;
     src->rga_handle = rga_handle;
-    src->rga_buffer = wrapbuffer_handle(rga_handle, (int)cap->width, (int)cap->height,
-                                        rga_format, wstride, (int)cap->height);
+    src->rga_buffer = rga_buffer;
     if (cpu_stage) {
         size_t map_size = (size_t)cap->pitch * cap->height;
         void *map = mmap(NULL, map_size, PROT_READ, MAP_SHARED, dma_fd, 0);
@@ -545,9 +704,7 @@ static int ensure_src_import(int drm_fd, struct src_import *src,
 
 static void release_cursor_import(struct cursor_import *cursor)
 {
-    if (cursor->rga_handle) {
-        releasebuffer_handle(cursor->rga_handle);
-    }
+    release_rga_handle(cursor->rga_handle);
     if (cursor->dma_fd >= 0) {
         close(cursor->dma_fd);
     }
@@ -591,13 +748,11 @@ static int ensure_cursor_import(int drm_fd, struct cursor_import *cursor,
     }
 
     int wstride = (int)(state->pitch / (uint32_t)bytes_per_pixel);
-    im_handle_param_t param = {
-        .width = (uint32_t)wstride,
-        .height = state->height,
-        .format = (uint32_t)rga_format,
-    };
-    rga_buffer_handle_t rga_handle = importbuffer_fd(dma_fd, &param);
-    if (!rga_handle) {
+    remydesk_rga_handle_t rga_handle = 0;
+    rga_buffer_t rga_buffer = {0};
+    if (wrap_rga_dma_fd(dma_fd, (int)state->width, (int)state->height,
+                        wstride, (int)state->height, rga_format,
+                        &rga_handle, &rga_buffer) != 0) {
         fprintf(stderr, "RGA cursor import failed for fb=%u fd=%d\n", state->fb_id, dma_fd);
         close(dma_fd);
         return -1;
@@ -613,8 +768,7 @@ static int ensure_cursor_import(int drm_fd, struct cursor_import *cursor,
     cursor->rga_format = rga_format;
     cursor->wstride = wstride;
     cursor->rga_handle = rga_handle;
-    cursor->rga_buffer = wrapbuffer_handle(rga_handle, (int)state->width, (int)state->height,
-                                           rga_format, wstride, (int)state->height);
+    cursor->rga_buffer = rga_buffer;
     return 0;
 }
 
@@ -624,6 +778,17 @@ static int blend_cursor_with_rga(struct cursor_import *cursor,
                                  uint32_t screen_width,
                                  uint32_t screen_height)
 {
+#if !REMYDESK_RGA_HANDLE_API
+    /* The RK3399 profile enables Xorg SWcursor, so the pointer is already in
+     * the primary framebuffer.  Avoid passing the old rga_buffer_t ABI into a
+     * newer private librga merely to blend an unused hardware cursor plane. */
+    (void)cursor;
+    (void)state;
+    (void)rgb;
+    (void)screen_width;
+    (void)screen_height;
+    return 0;
+#else
     if (!state->active || cursor->dma_fd < 0 || state->w <= 0 || state->h <= 0) {
         return 0;
     }
@@ -722,13 +887,12 @@ static int blend_cursor_with_rga(struct cursor_import *cursor,
         return 0;
     }
     return 0;
+#endif
 }
 
 static void release_dumb_rgb_buffer(int drm_fd, struct dumb_rgb_buffer *buf)
 {
-    if (buf->rga_handle) {
-        releasebuffer_handle(buf->rga_handle);
-    }
+    release_rga_handle(buf->rga_handle);
     if (buf->map && buf->map != MAP_FAILED) {
         munmap(buf->map, buf->size);
     }
@@ -774,13 +938,11 @@ static int create_dumb_rgb_buffer(int drm_fd, struct dumb_rgb_buffer *buf,
     }
 
     int wstride = (int)(create_req.pitch / (uint32_t)bytes_per_pixel);
-    im_handle_param_t param = {
-        .width = (uint32_t)wstride,
-        .height = height,
-        .format = (uint32_t)rga_format,
-    };
-    rga_buffer_handle_t rga_handle = importbuffer_fd(dma_fd, &param);
-    if (!rga_handle) {
+    remydesk_rga_handle_t rga_handle = 0;
+    rga_buffer_t rga_buffer = {0};
+    if (wrap_rga_dma_fd(dma_fd, (int)width, (int)height,
+                        wstride, (int)height, rga_format,
+                        &rga_handle, &rga_buffer) != 0) {
         fprintf(stderr, "RGA dumb RGB import failed fd=%d pitch=%u\n", dma_fd, create_req.pitch);
         close(dma_fd);
         struct drm_mode_destroy_dumb destroy_req;
@@ -795,7 +957,7 @@ static int create_dumb_rgb_buffer(int drm_fd, struct dumb_rgb_buffer *buf,
     map_req.handle = create_req.handle;
     if (drmIoctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &map_req) != 0) {
         fprintf(stderr, "DRM map dumb RGB buffer failed: %s\n", strerror(errno));
-        releasebuffer_handle(rga_handle);
+        release_rga_handle(rga_handle);
         close(dma_fd);
         struct drm_mode_destroy_dumb destroy_req;
         memset(&destroy_req, 0, sizeof(destroy_req));
@@ -808,7 +970,7 @@ static int create_dumb_rgb_buffer(int drm_fd, struct dumb_rgb_buffer *buf,
                      MAP_SHARED, drm_fd, map_req.offset);
     if (map == MAP_FAILED) {
         fprintf(stderr, "mmap dumb RGB buffer failed: %s\n", strerror(errno));
-        releasebuffer_handle(rga_handle);
+        release_rga_handle(rga_handle);
         close(dma_fd);
         struct drm_mode_destroy_dumb destroy_req;
         memset(&destroy_req, 0, sizeof(destroy_req));
@@ -827,8 +989,7 @@ static int create_dumb_rgb_buffer(int drm_fd, struct dumb_rgb_buffer *buf,
     buf->rga_format = rga_format;
     buf->wstride = wstride;
     buf->rga_handle = rga_handle;
-    buf->rga_buffer = wrapbuffer_handle(rga_handle, (int)width, (int)height,
-                                        rga_format, wstride, (int)height);
+    buf->rga_buffer = rga_buffer;
     return 0;
 }
 
@@ -889,6 +1050,153 @@ static int write_all(int fd, const void *data, size_t size)
     return 0;
 }
 
+static int stream_writer_init(struct stream_writer *writer, int fallback_fd,
+                              int initial_bitrate)
+{
+    memset(writer, 0, sizeof(*writer));
+    writer->fd = fallback_fd;
+    writer->ring_fd = -1;
+
+    const char *path = getenv("REMYDESK_H264_SHM");
+    if (!path || !*path) {
+        return 0;
+    }
+
+    /* Each encoder generation gets a new inode. This lets the Go consumer
+     * distinguish a hotplug restart from an idle producer without locks. */
+    if (unlink(path) != 0 && errno != ENOENT) {
+        fprintf(stderr, "unlink shared ring %s failed: %s\n", path, strerror(errno));
+        return -1;
+    }
+    writer->ring_map_size = REMYDESK_RING_HEADER_SIZE +
+        (size_t)REMYDESK_RING_SLOTS *
+        (REMYDESK_RING_SLOT_HEADER_SIZE + (size_t)REMYDESK_RING_SLOT_SIZE);
+    writer->ring_fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (writer->ring_fd < 0) {
+        fprintf(stderr, "open shared ring %s failed: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (ftruncate(writer->ring_fd, (off_t)writer->ring_map_size) != 0) {
+        fprintf(stderr, "resize shared ring %s failed: %s\n", path, strerror(errno));
+        close(writer->ring_fd);
+        writer->ring_fd = -1;
+        return -1;
+    }
+    writer->ring_map = mmap(NULL, writer->ring_map_size, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, writer->ring_fd, 0);
+    if (writer->ring_map == MAP_FAILED) {
+        writer->ring_map = NULL;
+        fprintf(stderr, "map shared ring %s failed: %s\n", path, strerror(errno));
+        close(writer->ring_fd);
+        writer->ring_fd = -1;
+        return -1;
+    }
+    memset(writer->ring_map, 0, writer->ring_map_size);
+    writer->ring = writer->ring_map;
+    writer->ring->version = REMYDESK_RING_VERSION;
+    writer->ring->slot_count = REMYDESK_RING_SLOTS;
+    writer->ring->slot_size = REMYDESK_RING_SLOT_SIZE;
+    atomic_store_explicit(&writer->ring->write_seq, 0, memory_order_relaxed);
+    atomic_store_explicit(&writer->ring->read_seq, 0, memory_order_relaxed);
+    atomic_store_explicit(&writer->ring->closed, 0, memory_order_relaxed);
+    atomic_store_explicit(&writer->ring->notify_seq, 0, memory_order_relaxed);
+    atomic_store_explicit(&writer->ring->requested_bitrate,
+                          (uint32_t)initial_bitrate, memory_order_relaxed);
+    atomic_store_explicit(&writer->ring->applied_bitrate,
+                          (uint32_t)initial_bitrate, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    writer->ring->magic = REMYDESK_RING_MAGIC;
+    fprintf(stderr, "h264 transport=shared-ring path=%s slots=%u slot_size=%u\n",
+            path, REMYDESK_RING_SLOTS, REMYDESK_RING_SLOT_SIZE);
+    return 0;
+}
+
+static int stream_writer_requested_bitrate(struct stream_writer *writer,
+                                           int fallback)
+{
+    if (!writer->ring) {
+        return fallback;
+    }
+    uint32_t requested = atomic_load_explicit(&writer->ring->requested_bitrate,
+                                               memory_order_acquire);
+    if (requested < 100000U || requested > 200000000U) {
+        return fallback;
+    }
+    return (int)requested;
+}
+
+static void stream_writer_set_applied_bitrate(struct stream_writer *writer,
+                                              int bitrate)
+{
+    if (writer->ring) {
+        atomic_store_explicit(&writer->ring->applied_bitrate,
+                              (uint32_t)bitrate, memory_order_release);
+    }
+}
+
+static void stream_writer_notify(struct stream_writer *writer)
+{
+    atomic_fetch_add_explicit(&writer->ring->notify_seq, 1, memory_order_release);
+    (void)syscall(SYS_futex, &writer->ring->notify_seq, FUTEX_WAKE, 1, NULL, NULL, 0);
+}
+
+static int stream_writer_write(struct stream_writer *writer,
+                               const void *data, size_t size)
+{
+    if (!writer->ring) {
+        return write_all(writer->fd, data, size);
+    }
+    if (size > writer->ring->slot_size) {
+        fprintf(stderr, "encoded packet exceeds shared ring slot: %zu > %u\n",
+                size, writer->ring->slot_size);
+        return -1;
+    }
+
+    uint64_t write_seq = atomic_load_explicit(&writer->ring->write_seq,
+                                               memory_order_relaxed);
+    while (!stop_requested) {
+        uint64_t read_seq = atomic_load_explicit(&writer->ring->read_seq,
+                                                  memory_order_acquire);
+        if (write_seq - read_seq < writer->ring->slot_count) {
+            break;
+        }
+        usleep(1000);
+    }
+    if (stop_requested) {
+        return -1;
+    }
+
+    size_t stride = REMYDESK_RING_SLOT_HEADER_SIZE + writer->ring->slot_size;
+    uint8_t *slot = (uint8_t *)writer->ring_map + REMYDESK_RING_HEADER_SIZE +
+                    (write_seq % writer->ring->slot_count) * stride;
+    uint32_t length = (uint32_t)size;
+    memcpy(slot, &length, sizeof(length));
+    memset(slot + sizeof(length), 0, REMYDESK_RING_SLOT_HEADER_SIZE - sizeof(length));
+    memcpy(slot + REMYDESK_RING_SLOT_HEADER_SIZE, data, size);
+    atomic_store_explicit(&writer->ring->write_seq, write_seq + 1,
+                          memory_order_release);
+    stream_writer_notify(writer);
+    return 0;
+}
+
+static void stream_writer_close(struct stream_writer *writer)
+{
+    if (writer->ring) {
+        atomic_store_explicit(&writer->ring->closed, 1, memory_order_release);
+        stream_writer_notify(writer);
+        munmap(writer->ring_map, writer->ring_map_size);
+    }
+    if (writer->ring_fd >= 0) {
+        close(writer->ring_fd);
+    }
+    if (writer->fd >= 0) {
+        close(writer->fd);
+    }
+    memset(writer, 0, sizeof(*writer));
+    writer->fd = -1;
+    writer->ring_fd = -1;
+}
+
 static int dma_buf_publish(int fd)
 {
     struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW };
@@ -906,6 +1214,40 @@ static void add_ns(struct timespec *ts, long ns)
         ts->tv_nsec -= 1000000000L;
         ts->tv_sec++;
     }
+}
+
+static int64_t timespec_diff_ns(const struct timespec *later,
+                                const struct timespec *earlier)
+{
+    return ((int64_t)later->tv_sec - (int64_t)earlier->tv_sec) * 1000000000LL +
+           ((int64_t)later->tv_nsec - (int64_t)earlier->tv_nsec);
+}
+
+static long env_long_range(const char *name, long fallback, long minimum, long maximum)
+{
+    const char *value = getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (errno || end == value || *end || parsed < minimum || parsed > maximum) {
+        fprintf(stderr, "invalid %s=%s; using %ld\n", name, value, fallback);
+        return fallback;
+    }
+    return parsed;
+}
+
+static int timespec_cmp(const struct timespec *a, const struct timespec *b)
+{
+    if (a->tv_sec != b->tv_sec) {
+        return a->tv_sec < b->tv_sec ? -1 : 1;
+    }
+    if (a->tv_nsec != b->tv_nsec) {
+        return a->tv_nsec < b->tv_nsec ? -1 : 1;
+    }
+    return 0;
 }
 
 static int parse_u32_arg(const char *value, uint32_t *out)
@@ -952,6 +1294,7 @@ static int rga_convert_frame(rga_buffer_t src, rga_buffer_t dst,
                              uint32_t dst_width, uint32_t dst_height,
                              const char *label)
 {
+#if REMYDESK_RGA_HANDLE_API
     im_rect src_rect = { 0, 0, (int)src_width, (int)src_height };
     im_rect dst_rect = { 0, 0, (int)dst_width, (int)dst_height };
     im_rect empty_rect = { 0, 0, 0, 0 };
@@ -966,13 +1309,13 @@ static int rga_convert_frame(rga_buffer_t src, rga_buffer_t dst,
         }
     }
 
+    IM_STATUS last_status = IM_STATUS_FAILED;
     int cores[] = {
         IM_SCHEDULER_RGA2_CORE0,
         IM_SCHEDULER_RGA3_CORE0,
         IM_SCHEDULER_RGA3_CORE1,
     };
 
-    IM_STATUS last_status = IM_STATUS_FAILED;
     for (size_t i = 0; i < sizeof(cores) / sizeof(cores[0]); i++) {
         im_opt_t opt;
         memset(&opt, 0, sizeof(opt));
@@ -986,9 +1329,37 @@ static int rga_convert_frame(rga_buffer_t src, rga_buffer_t dst,
             return 0;
         }
     }
-
     fprintf(stderr, "%s failed: %s\n", label, imStrError(last_status));
     return -1;
+#else
+    /*
+     * Firefly's RK3399 Ubuntu image uses the legacy RGA2 ioctl ABI. Its im2d
+     * handle import is not supported even by the private 1.10 runtime. Build
+     * the old rga_info_t request explicitly, using headers that match the
+     * runtime so the structure layout remains ABI-safe.
+     */
+    rga_info_t legacy_src;
+    rga_info_t legacy_dst;
+    memset(&legacy_src, 0, sizeof(legacy_src));
+    memset(&legacy_dst, 0, sizeof(legacy_dst));
+    legacy_src.fd = src.fd;
+    legacy_dst.fd = dst.fd;
+    legacy_src.mmuFlag = 1;
+    legacy_dst.mmuFlag = 1;
+    legacy_src.color_space_mode = src.color_space_mode;
+    legacy_dst.color_space_mode = dst.color_space_mode;
+    rga_set_rect(&legacy_src.rect, 0, 0,
+                 (int)src_width, (int)src_height,
+                 src.wstride, src.hstride, src.format);
+    rga_set_rect(&legacy_dst.rect, 0, 0,
+                 (int)dst_width, (int)dst_height,
+                 dst.wstride, dst.hstride, dst.format);
+    if (c_RkRgaBlit(&legacy_src, &legacy_dst, NULL) == 0) {
+        return 0;
+    }
+    fprintf(stderr, "%s failed through legacy RGA2 DMA-BUF blit\n", label);
+    return -1;
+#endif
 }
 
 static int configure_encoder(MppCtx ctx, MppApi *mpi,
@@ -1027,14 +1398,19 @@ static int configure_encoder(MppCtx ctx, MppApi *mpi,
     mpp_enc_cfg_set_u32(cfg, "rc:drop_thd", 20);
     mpp_enc_cfg_set_u32(cfg, "rc:drop_gap", 1);
     mpp_enc_cfg_set_s32(cfg, "rc:bps_target", bitrate);
-    mpp_enc_cfg_set_s32(cfg, "rc:bps_max", bitrate * 17 / 16);
+    mpp_enc_cfg_set_s32(cfg, "rc:bps_max", (RK_S32)((int64_t)bitrate * 17 / 16));
     mpp_enc_cfg_set_s32(cfg, "rc:bps_min", bitrate / 16);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denom", 1);
+    const int legacy_fps_keys = getenv("REMYDESK_MPP_LEGACY_FPS_KEYS") != NULL;
+    mpp_enc_cfg_set_s32(cfg,
+                        legacy_fps_keys ? "rc:fps_in_denorm" : "rc:fps_in_denom",
+                        1);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_out_flex", 0);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num", fps);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denom", 1);
+    mpp_enc_cfg_set_s32(cfg,
+                        legacy_fps_keys ? "rc:fps_out_denorm" : "rc:fps_out_denom",
+                        1);
     /* Periodic IDR generation is broken in this vendor MPP build and causes
      * Chromium to freeze at the GOP boundary.  A fresh encoder is created for
      * every viewer, so it always starts with a clean IDR; keep that session's
@@ -1068,15 +1444,37 @@ static int configure_encoder(MppCtx ctx, MppApi *mpi,
     return 0;
 }
 
+static int update_encoder_bitrate(MppCtx ctx, MppApi *mpi, int bitrate)
+{
+    MppEncCfg cfg = NULL;
+    MPP_RET ret = mpp_enc_cfg_init(&cfg);
+    if (ret) {
+        fprintf(stderr, "runtime mpp_enc_cfg_init failed %d\n", ret);
+        return -1;
+    }
+    ret = mpi->control(ctx, MPP_ENC_GET_CFG, cfg);
+    if (!ret) {
+        mpp_enc_cfg_set_s32(cfg, "rc:bps_target", bitrate);
+        mpp_enc_cfg_set_s32(cfg, "rc:bps_max", (RK_S32)((int64_t)bitrate * 17 / 16));
+        mpp_enc_cfg_set_s32(cfg, "rc:bps_min", bitrate / 16);
+        ret = mpi->control(ctx, MPP_ENC_SET_CFG, cfg);
+    }
+    mpp_enc_cfg_deinit(cfg);
+    if (ret) {
+        fprintf(stderr, "runtime MPP bitrate update failed %d target=%d\n",
+                ret, bitrate);
+        return -1;
+    }
+    return 0;
+}
+
 static void release_encode_buffers(struct encode_buffer *buffers, int count)
 {
     if (!buffers) {
         return;
     }
     for (int i = 0; i < count; i++) {
-        if (buffers[i].rga_handle) {
-            releasebuffer_handle(buffers[i].rga_handle);
-        }
+        release_rga_handle(buffers[i].rga_handle);
         if (buffers[i].mpp_buf) {
             mpp_buffer_put(buffers[i].mpp_buf);
         }
@@ -1109,21 +1507,12 @@ static int init_encode_buffers(MppBufferGroup group,
             return -1;
         }
 
-        im_handle_param_t dst_param = {
-            .width = width,
-            .height = height,
-            .format = (uint32_t)dst_rga_format,
-        };
-        buffers[i].rga_handle = importbuffer_fd(buffers[i].dma_fd, &dst_param);
-        if (!buffers[i].rga_handle) {
+        if (wrap_rga_dma_fd(buffers[i].dma_fd, (int)width, (int)height,
+                            (int)width, (int)ver_stride, dst_rga_format,
+                            &buffers[i].rga_handle, &buffers[i].rga_buffer) != 0) {
             fprintf(stderr, "RGA destination import[%d] failed fd=%d\n", i, buffers[i].dma_fd);
             return -1;
         }
-
-        buffers[i].rga_buffer = wrapbuffer_handle(buffers[i].rga_handle,
-                                                  (int)width, (int)height,
-                                                  dst_rga_format,
-                                                  (int)width, (int)ver_stride);
     }
     return 0;
 }
@@ -1155,8 +1544,12 @@ static int encode_one_frame(MppCtx ctx, MppApi *mpi, MppBuffer mpp_buf,
                             MppBuffer pkt_buf,
                             uint32_t width, uint32_t height,
                             MppFrameFormat mpp_format,
-                            int64_t pts_us, int out_fd)
+                            int64_t pts_us, struct stream_writer *writer,
+                            size_t *encoded_size)
 {
+    if (encoded_size) {
+        *encoded_size = 0;
+    }
     uint32_t ver_stride = (height + 15U) & ~15U;
     MppFrame frame = NULL;
     MPP_RET ret = mpp_frame_init(&frame);
@@ -1201,7 +1594,12 @@ static int encode_one_frame(MppCtx ctx, MppApi *mpi, MppBuffer mpp_buf,
         return -1;
     }
 
-    for (int i = 0; i < 128 && !stop_requested; i++) {
+    /* Once a frame has been submitted, always drain its output packet to EOI
+     * before honoring SIGTERM. Dropping the packet reference while the vendor
+     * MPP task still owns it causes the negative ref_count and pool assertions
+     * previously seen on every service stop. The outer capture loop observes
+     * stop_requested before it submits another frame. */
+    for (int i = 0; i < 128; i++) {
         ret = mpi->encode_get_packet(ctx, &packet);
         if (ret == MPP_ERR_TIMEOUT || !packet) {
             usleep(1000);
@@ -1224,7 +1622,10 @@ static int encode_one_frame(MppCtx ctx, MppApi *mpi, MppBuffer mpp_buf,
         }
         int write_rc = 0;
         if (len) {
-            write_rc = write_all(out_fd, pos, len);
+            write_rc = stream_writer_write(writer, pos, len);
+            if (encoded_size && write_rc == 0) {
+                *encoded_size += len;
+            }
         }
         mpp_packet_deinit(&packet);
         if (write_rc != 0) {
@@ -1245,17 +1646,15 @@ static int encode_one_frame(MppCtx ctx, MppApi *mpi, MppBuffer mpp_buf,
     if (packet) {
         mpp_packet_deinit(&packet);
     }
-    if (!stop_requested) {
-        fprintf(stderr, "encode_get_packet did not finish a frame\n");
-    }
-    return stop_requested ? 0 : -1;
+    fprintf(stderr, "encode_get_packet did not finish a frame\n");
+    return -1;
 }
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [-c /dev/dri/card0] [-f fps] [-b bitrate] [-n frames] [-q]\n"
-            "          [--no-cursor] [--cpu-stage] [--xrgb-as-alpha] [--wait-vblank]\n"
+            "          [--no-cursor] [--cpu-stage] [--xrgb-as-alpha] [--wait-vblank|--no-wait-vblank]\n"
             "          [--buffer-count 1..8]\n"
             "          [--color default|bt709|bt601] [--yuv nv12|nv21]\n"
             "          [--out-width pixels] [--out-height pixels]\n"
@@ -1277,7 +1676,9 @@ int main(int argc, char **argv)
     int cpu_stage = 0;
     int xrgb_as_alpha = 0;
     int wait_vblank = 1;
-    int buffer_count = 3;
+    /* encode_put_frame / encode_get_packet is used synchronously, so one
+     * input surface is enough and avoids needless IOMMU mappings on RK3399. */
+    int buffer_count = 1;
     uint32_t out_width = 0;
     uint32_t out_height = 0;
     int color_mode = IM_COLOR_SPACE_DEFAULT;
@@ -1303,6 +1704,7 @@ int main(int argc, char **argv)
         OPT_CPU_STAGE,
         OPT_XRGB_AS_ALPHA,
         OPT_WAIT_VBLANK,
+        OPT_NO_WAIT_VBLANK,
         OPT_BUFFER_COUNT,
     };
     static const struct option long_options[] = {
@@ -1317,6 +1719,7 @@ int main(int argc, char **argv)
         { "cpu-stage", no_argument, NULL, OPT_CPU_STAGE },
         { "xrgb-as-alpha", no_argument, NULL, OPT_XRGB_AS_ALPHA },
         { "wait-vblank", no_argument, NULL, OPT_WAIT_VBLANK },
+        { "no-wait-vblank", no_argument, NULL, OPT_NO_WAIT_VBLANK },
         { "buffer-count", required_argument, NULL, OPT_BUFFER_COUNT },
         { "help", no_argument, NULL, 'h' },
         { 0, 0, 0, 0 },
@@ -1351,6 +1754,9 @@ int main(int argc, char **argv)
             break;
         case OPT_WAIT_VBLANK:
             wait_vblank = 1;
+            break;
+        case OPT_NO_WAIT_VBLANK:
+            wait_vblank = 0;
             break;
         case OPT_BUFFER_COUNT:
             buffer_count = atoi(optarg);
@@ -1422,6 +1828,12 @@ int main(int argc, char **argv)
         }
     }
 
+#if !REMYDESK_RGA_HANDLE_API
+    /* RK3399 uses Xorg's software cursor in the scanout framebuffer.  The
+     * legacy headers cannot safely call the newer im2d cursor-blend ABI. */
+    cursor_enabled = 0;
+#endif
+
     if (fps <= 0 || fps > 120) {
         fprintf(stderr, "invalid fps: %d\n", fps);
         return 1;
@@ -1451,6 +1863,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, on_signal);
     signal(SIGUSR1, on_idr_signal);
+    signal(SIGUSR2, on_activity_signal);
     setvbuf(stderr, NULL, _IONBF, 0);
 
     /* librga writes version/diagnostic text to stdout.  Preserve the original
@@ -1462,6 +1875,12 @@ int main(int argc, char **argv)
         return 1;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    struct stream_writer stream;
+    if (stream_writer_init(&stream, stream_fd, bitrate) != 0) {
+        close(stream_fd);
+        return 1;
+    }
 
     int drm_fd = open(card, O_RDWR | O_CLOEXEC);
     if (drm_fd < 0) {
@@ -1478,6 +1897,11 @@ int main(int argc, char **argv)
     }
     if (!out_width) out_width = cap.width;
     if (!out_height) out_height = cap.height;
+    int crtc_index = crtc_index_for_id(drm_fd, cap.crtc_id);
+    if (wait_vblank && crtc_index < 0) {
+        fprintf(stderr, "unable to resolve CRTC index; disabling vblank wait\n");
+        wait_vblank = 0;
+    }
 
     char fourcc[5];
     fourcc_to_string(cap.fourcc, fourcc);
@@ -1567,7 +1991,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    enum { PACKET_BUFFER_COUNT = 8 };
+    /* The stream uses MPP's synchronous put/get API and fully drains each
+     * frame before submitting the next one. One persistent packet buffer is
+     * therefore sufficient and matches the vendor mpi_enc_test example. On
+     * the old RK3399 IOMMU driver, cycling otherwise-idle packet mappings can
+     * also make encoder resets much more expensive. */
+    enum { PACKET_BUFFER_COUNT = 1 };
     MppBufferGroup packet_group = NULL;
     MppBuffer packet_buffers[PACKET_BUFFER_COUNT] = { 0 };
     size_t packet_alloc_size = (size_t)out_width * out_ver_stride * 3 / 2 +
@@ -1638,23 +2067,71 @@ int main(int argc, char **argv)
     memset(&cursor, 0, sizeof(cursor));
     cursor.dma_fd = -1;
 
+    /* Plane topology normally stays fixed for the stream lifetime. Rechecking
+     * every frame is especially expensive on the legacy 4.4 DRM driver. */
+    warn_active_overlay_planes(drm_fd, cap.crtc_id, cap.fb_id);
+
     struct timespec next_frame;
     clock_gettime(CLOCK_MONOTONIC, &next_frame);
-    long frame_interval_ns = 1000000000L / fps;
+    struct timespec capture_started = next_frame;
+    struct timespec quiet_since = next_frame;
+    int quiet_tracking = 0;
+    int idle_mode = 0;
+    int dynamic_fps = getenv("REMYDESK_DYNAMIC_FPS") != NULL &&
+                      strcmp(getenv("REMYDESK_DYNAMIC_FPS"), "0") != 0;
+    int idle_fps = (int)env_long_range("REMYDESK_IDLE_FPS", 8, 1, fps);
+    long idle_after_ms = env_long_range("REMYDESK_IDLE_AFTER_MS", 3000, 250, 600000);
+    size_t idle_frame_bytes = (size_t)env_long_range("REMYDESK_IDLE_FRAME_BYTES",
+                                                     12000, 128, 16 * 1024 * 1024);
+    long active_interval_ns = 1000000000L / fps;
+    long idle_interval_ns = 1000000000L / idle_fps;
     int64_t frame_index = 0;
     int exit_code = 0;
+    int applied_bitrate = bitrate;
+
+    if (dynamic_fps && !quiet) {
+        fprintf(stderr,
+                "dynamic-fps=on active=%d idle=%d idle_after_ms=%ld frame_bytes_threshold=%zu\n",
+                fps, idle_fps, idle_after_ms, idle_frame_bytes);
+    }
 
     while (!stop_requested) {
+        int requested_bitrate = stream_writer_requested_bitrate(&stream,
+                                                                 applied_bitrate);
+        if (requested_bitrate != applied_bitrate) {
+            if (update_encoder_bitrate(ctx, mpi, requested_bitrate) == 0) {
+                if (!quiet) {
+                    fprintf(stderr, "adaptive-bitrate applied=%d previous=%d\n",
+                            requested_bitrate, applied_bitrate);
+                }
+                applied_bitrate = requested_bitrate;
+                stream_writer_set_applied_bitrate(&stream, applied_bitrate);
+            } else {
+                if (stream.ring) {
+                    atomic_store_explicit(&stream.ring->requested_bitrate,
+                                          (uint32_t)applied_bitrate,
+                                          memory_order_release);
+                }
+            }
+        }
+        if (activity_requested) {
+            activity_requested = 0;
+            quiet_tracking = 0;
+            if (idle_mode && !quiet) {
+                fprintf(stderr, "dynamic-fps resumed active=%d input-activity\n", fps);
+            }
+            idle_mode = 0;
+        }
         if (wait_vblank) {
             static int warned_vblank;
-            if (wait_for_crtc_vblank(drm_fd, cap.crtc_id) != 0 && !warned_vblank) {
+            if (wait_for_crtc_vblank(drm_fd, crtc_index) != 0 && !warned_vblank) {
                 fprintf(stderr, "drmWaitVBlank failed: %s; continuing without vblank sync\n", strerror(errno));
                 warned_vblank = 1;
             }
         }
 
         struct capture_fb cur;
-        if (find_connected_display_fb(drm_fd, &cur) != 0) {
+        if (get_crtc_capture_fb(drm_fd, cap.crtc_id, &cur) != 0) {
             exit_code = 1;
             break;
         }
@@ -1674,7 +2151,6 @@ int main(int argc, char **argv)
             exit_code = 1;
             break;
         }
-        warn_active_overlay_planes(drm_fd, cap.crtc_id, cur.fb_id);
 
         struct encode_buffer *enc = &enc_buffers[frame_index % buffer_count];
         rga_buffer_t dst = enc->rga_buffer;
@@ -1750,22 +2226,23 @@ int main(int argc, char **argv)
                    (size_t)out_width * out_ver_stride / 2);
         }
 
-        /* RGA and MPP are separate DMA masters.  IM_SYNC waits for the RGA
-         * job, but this older BSP also needs an explicit dma-buf ownership /
-         * cache transition before the encoder consumes the NV12 surface. */
-        if (dma_buf_publish(enc->dma_fd) != 0 && getenv("REMYDESK_PACKET_DEBUG")) {
+        /* IM_SYNC completes the RGA DMA job before MPP consumes the surface.
+         * DMA_BUF_IOCTL_SYNC is a CPU-access cache operation, not a fence
+         * between these two DMA devices; on the RK3399 4.4 BSP it takes about
+         * 200 ms per frame. Keep it as an opt-in workaround for other BSPs. */
+        if (getenv("REMYDESK_DMA_BUF_SYNC") &&
+            dma_buf_publish(enc->dma_fd) != 0 && getenv("REMYDESK_PACKET_DEBUG")) {
             fprintf(stderr, "DMA_BUF_IOCTL_SYNC failed: %s\n", strerror(errno));
         }
 
-        if (frame_index == 0) {
-            force_idr_requested = 1;
-        }
-
-        int64_t pts_us = frame_index * 1000000LL / fps;
+        struct timespec capture_now;
+        clock_gettime(CLOCK_MONOTONIC, &capture_now);
+        int64_t pts_us = timespec_diff_ns(&capture_now, &capture_started) / 1000LL;
         MppBuffer pkt_buf = packet_buffers[frame_index % PACKET_BUFFER_COUNT];
+        size_t encoded_size = 0;
         if (encode_one_frame(ctx, mpi, enc->mpp_buf, pkt_buf,
                              out_width, out_height,
-                             mpp_format, pts_us, stream_fd) != 0) {
+                             mpp_format, pts_us, &stream, &encoded_size) != 0) {
             if (!stop_requested) {
                 exit_code = 1;
             }
@@ -1777,8 +2254,41 @@ int main(int argc, char **argv)
             break;
         }
 
-        add_ns(&next_frame, frame_interval_ns);
-        while (!stop_requested &&
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (dynamic_fps) {
+            if (encoded_size <= idle_frame_bytes) {
+                if (!quiet_tracking) {
+                    quiet_since = now;
+                    quiet_tracking = 1;
+                } else if (!idle_mode &&
+                           timespec_diff_ns(&now, &quiet_since) >= idle_after_ms * 1000000LL) {
+                    idle_mode = 1;
+                    if (!quiet) {
+                        fprintf(stderr, "dynamic-fps entered idle=%d encoded_bytes=%zu\n",
+                                idle_fps, encoded_size);
+                    }
+                }
+            } else {
+                quiet_tracking = 0;
+                if (idle_mode) {
+                    idle_mode = 0;
+                    if (!quiet) {
+                        fprintf(stderr, "dynamic-fps resumed active=%d encoded_bytes=%zu\n",
+                                fps, encoded_size);
+                    }
+                }
+            }
+        }
+
+        add_ns(&next_frame, idle_mode ? idle_interval_ns : active_interval_ns);
+        if (timespec_cmp(&next_frame, &now) <= 0) {
+            /* A blocked RGA/MPP/network stage can leave the absolute deadline
+             * far behind. Do not encode a burst of catch-up frames: receivers
+             * interpret their fixed RTP timestamps as delayed video. */
+            next_frame = now;
+        }
+        while (!stop_requested && !activity_requested &&
                clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame, NULL) == EINTR) {
         }
     }
@@ -1788,6 +2298,20 @@ int main(int argc, char **argv)
     if (cursor_enabled || cpu_stage) {
         release_dumb_rgb_buffer(drm_fd, &rgb_stage);
     }
+
+    /* MPP owns references to the input and output buffers until reset and
+     * destroy complete. Releasing them first triggers refcount underflow in
+     * the 8a85dc5d vendor library and can leave the RK3399 VPU/IOMMU wedged
+     * for the next viewer session. Follow mpi_enc_test's teardown order. */
+    if (ctx) {
+        MPP_RET reset_ret = mpi->reset(ctx);
+        if (reset_ret && !quiet) {
+            fprintf(stderr, "encoder reset failed %d\n", reset_ret);
+        }
+        mpp_destroy(ctx);
+        ctx = NULL;
+    }
+
     release_encode_buffers(enc_buffers, buffer_count);
     free(enc_buffers);
     for (int i = 0; i < PACKET_BUFFER_COUNT; i++) {
@@ -1795,9 +2319,8 @@ int main(int argc, char **argv)
     }
     mpp_buffer_group_put(packet_group);
     mpp_buffer_group_put(group);
-    mpp_destroy(ctx);
     close(drm_fd);
-    close(stream_fd);
+    stream_writer_close(&stream);
 
     if (!quiet) {
         fprintf(stderr, "stopped after %lld frames\n", (long long)frame_index);

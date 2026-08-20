@@ -10,6 +10,9 @@ const state = {
   layoutSaveTimer: null,
   dragPath: "",
   epubReader: null,
+  downloadPollTimer: null,
+  downloadStatuses: new Map(),
+  downloadsActive: false,
 };
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -1066,6 +1069,73 @@ function mountDesktop(remount = false) {
   stage.replaceChildren(frame);
 }
 
+const downloadStatusLabels = {
+  queued: "排队中",
+  running: "正在下载",
+  completed: "已完成",
+  failed: "失败",
+};
+
+function renderDownloads(tasks) {
+  const list = $("#downloadList");
+  list.replaceChildren();
+  $("#downloadEmpty").hidden = tasks.length !== 0;
+  tasks.forEach((task) => {
+    const item = document.createElement("div");
+    item.className = `download-task status-${task.status}`;
+
+    const icon = document.createElement("div");
+    icon.className = "download-task-icon";
+    const iconName = task.status === "completed" ? "circle-check" :
+      task.status === "failed" ? "circle-alert" :
+      task.status === "running" ? "loader-circle" : "clock-3";
+    icon.innerHTML = `<i data-lucide="${iconName}"></i>`;
+
+    const detail = document.createElement("div");
+    detail.className = "download-task-detail";
+    const name = document.createElement("strong");
+    name.textContent = task.name;
+    name.title = task.url;
+    const meta = document.createElement("small");
+    const queue = task.status === "queued" ? ` · 队列第 ${task.queue_position} 位` : "";
+    const bytes = task.bytes ? ` · ${formatSize(task.bytes)}` : "";
+    meta.textContent = `${downloadStatusLabels[task.status] || task.status}${queue}${bytes}`;
+    detail.append(name, meta);
+    if (task.error) {
+      const error = document.createElement("small");
+      error.className = "download-task-error";
+      error.textContent = task.error;
+      detail.append(error);
+    }
+    item.append(icon, detail);
+    list.append(item);
+  });
+  lucide.createIcons({ nodes: [list] });
+}
+
+async function loadDownloads() {
+  const data = await api("/api/downloads");
+  let completedNow = false;
+  data.tasks.forEach((task) => {
+    const previous = state.downloadStatuses.get(task.id);
+    if (previous && previous !== "completed" && task.status === "completed") completedNow = true;
+    state.downloadStatuses.set(task.id, task.status);
+  });
+  state.downloadsActive = data.tasks.some((task) => task.status === "queued" || task.status === "running");
+  renderDownloads(data.tasks);
+  if (completedNow && !state.path) await loadFiles("");
+  return data.tasks;
+}
+
+function startDownloadPolling() {
+  clearTimeout(state.downloadPollTimer);
+  if (!$("#downloaderDialog").open && !state.downloadsActive) return;
+  state.downloadPollTimer = setTimeout(async () => {
+    try { await loadDownloads(); } catch (error) { toast(error.message); }
+    startDownloadPolling();
+  }, 1000);
+}
+
 function closeDialog(event) {
   const dialog = event.target.closest("dialog");
   if (dialog.id === "previewDialog") {
@@ -1095,6 +1165,35 @@ $("#mkdirButton").addEventListener("click", async () => {
   }
 });
 $("#uploadButton").addEventListener("click", () => $("#fileInput").click());
+$("#downloaderButton").addEventListener("click", async () => {
+  $("#downloaderDialog").showModal();
+  try { await loadDownloads(); } catch (error) { toast(error.message); }
+  startDownloadPolling();
+  $("#downloadUrl").focus();
+});
+$("#downloaderDialog").addEventListener("close", () => {
+  clearTimeout(state.downloadPollTimer);
+  state.downloadPollTimer = null;
+  startDownloadPolling();
+});
+$("#downloadForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("#downloadUrl");
+  const button = $("#addDownload");
+  try {
+    button.disabled = true;
+    await jsonPost("/api/downloads", { url: input.value.trim() });
+    input.value = "";
+    await loadDownloads();
+    startDownloadPolling();
+    toast("下载任务已加入队列");
+    input.focus();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
 $("#fileInput").addEventListener("change", async (event) => {
   try {
     await uploadDroppedFiles(Array.from(event.target.files), state.path);

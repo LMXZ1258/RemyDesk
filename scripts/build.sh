@@ -3,6 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JOBS="${JOBS:-$(nproc)}"
+BUILD_PROFILE="${REMYDESK_BUILD_PROFILE:-auto}"
+
+if [[ "$BUILD_PROFILE" == auto ]]; then
+  BUILD_PROFILE="$($ROOT/scripts/detect-profile.sh)"
+fi
 
 go_version_ok() {
   local candidate="$1"
@@ -46,7 +51,17 @@ select_go() {
 cmake -S "$ROOT" -B "$ROOT/build" -DCMAKE_BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}"
 cmake --build "$ROOT/build" -j"$JOBS"
 
-make -C "$ROOT/native/desktop-streamer" -j"$JOBS" drm_fb_probe drm_rga_mpp_stream
+NATIVE_MAKE_ARGS=()
+if [[ "$BUILD_PROFILE" == "firefly-rk3399" ]]; then
+  RK3399_RGA_ROOT="$ROOT/third_party/librga/rk3399"
+  if [[ ! -f "$RK3399_RGA_ROOT/librga.so.2" ||
+        ! -f "$RK3399_RGA_ROOT/include/rga/im2d.h" ]]; then
+    "$ROOT/scripts/fetch-rk3399-librga.sh" "$RK3399_RGA_ROOT/librga.so.2"
+  fi
+  NATIVE_MAKE_ARGS+=("RK3399_RGA_ROOT=$RK3399_RGA_ROOT")
+fi
+make -C "$ROOT/native/desktop-streamer" -j"$JOBS" \
+  "${NATIVE_MAKE_ARGS[@]}" drm_fb_probe drm_rga_mpp_stream
 
 if [[ "${REMYDESK_USE_BUNDLED_PUBLISHER:-0}" == "1" ]]; then
   PUBLISHER="$ROOT/native/webrtc-publisher/remydesk-webrtc-publisher"
@@ -65,7 +80,9 @@ else
   (
     cd "$ROOT/native/webrtc-publisher"
     "$GO_BIN" test ./...
-    CGO_ENABLED="${CGO_ENABLED:-0}" "$GO_BIN" build -trimpath -ldflags "-s -w" -o remydesk-webrtc-publisher .
+    VERSION="$(tr -d '[:space:]' <"$ROOT/VERSION")"
+    CGO_ENABLED="${CGO_ENABLED:-0}" "$GO_BIN" build -trimpath \
+      -ldflags "-s -w -X main.version=$VERSION" -o remydesk-webrtc-publisher .
   )
 fi
 

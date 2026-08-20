@@ -1,0 +1,15 @@
+.git
+.github
+build
+build-*
+dist
+third_party/librga/rk3399
+native/desktop-streamer/drm_fb_probe
+native/desktop-streamer/drm_rga_mpp_stream
+native/desktop-streamer/drm_rga_snapshot
+native/desktop-streamer/drm_rga_mpp_frame
+native/webrtc-publisher/remydesk-webrtc-publisher
+RemyDesk-*-installer-*.sh
+*.zip
+*.tar
+*.tar.gz

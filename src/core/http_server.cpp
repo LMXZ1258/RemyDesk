@@ -72,7 +72,7 @@ std::string readFile(const fs::path &path) {
 }  // namespace
 
 HttpServer::HttpServer(Config config)
-    : config_(std::move(config)), files_(config_), network_(config_), services_(config_) {
+    : config_(std::move(config)), files_(config_), downloads_(config_), network_(config_), services_(config_) {
     server_.set_payload_max_length(1024ULL * 1024ULL * 1024ULL);
     server_.set_read_timeout(60, 0);
     server_.set_write_timeout(60, 0);
@@ -130,7 +130,7 @@ void HttpServer::routes() {
     });
 
     server_.Get("/api/health", [this](const auto &, auto &response) {
-        sendJson(response, {{"ok", true}, {"service", "remydeskd"}, {"version", "0.1.0"},
+        sendJson(response, {{"ok", true}, {"service", "remydeskd"}, {"version", REMYDESK_VERSION},
                             {"storage_root", config_.storageRoot.string()}});
     });
     server_.Get("/api/hardware", [this](const auto &, auto &response) {
@@ -198,6 +198,16 @@ void HttpServer::routes() {
             if (!temporary.empty()) { std::error_code ignored; fs::remove(temporary, ignored); }
             sendError(response, exception);
         }
+    });
+    server_.Get("/api/downloads", [this](const auto &, auto &response) {
+        try { sendJson(response, downloads_.list()); }
+        catch (const std::exception &exception) { sendError(response, exception, 500); }
+    });
+    server_.Post("/api/downloads", [this](const auto &request, auto &response) {
+        try {
+            const auto body = bodyJson(request);
+            sendJson(response, downloads_.enqueue(body.value("url", "")), 202);
+        } catch (const std::exception &exception) { sendError(response, exception); }
     });
     server_.Post("/api/mkdir", [this](const auto &request, auto &response) {
         try { const auto body = bodyJson(request); sendJson(response, files_.createDirectory(body.value("path", ""), body.value("name", ""))); }

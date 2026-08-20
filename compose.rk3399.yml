@@ -1,0 +1,33 @@
+version: "3.3"
+
+services:
+  remydesk:
+    image: ghcr.io/lmxz1258/remydesk:rk3399-latest
+    container_name: remydesk
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    environment:
+      REMYDESK_AUTH_USER: remy
+      REMYDESK_AUTH_PASSWORD: ""
+      REMYDESK_DESKTOP_AUTOSTART: "1"
+      REMYDESK_AUTO_HOTSPOT: "false"
+      REMYDESK_VIDEO_WIDTH: "1920"
+      REMYDESK_VIDEO_HEIGHT: "1080"
+      REMYDESK_VIDEO_FPS: "30"
+      REMYDESK_VIDEO_BITRATE: "6000000"
+      H264_ADAPTIVE_BITRATE: "1"
+      H264_BITRATE_MIN: "2000000"
+      H264_BITRATE_MAX: "8000000"
+      HDMI_REQUIRED_MODE: 1920x1080
+      INPUT_WIDTH: "1920"
+      INPUT_HEIGHT: "1080"
+      XAUTHORITY: /var/run/lightdm/root/:0
+    volumes:
+      - ./remydesk-data:/srv/remydesk/data
+      - ./remydesk-state:/var/lib/remydesk
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - /run/user:/run/user:ro
+      - /var/run/lightdm:/var/run/lightdm:ro
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - /run/udev:/run/udev:ro

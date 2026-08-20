@@ -1,6 +1,6 @@
 # RemyDesk
 
-RemyDesk 是面向 RK3588/RK3588S Linux 开发板的局域网文件桌面、Wi-Fi 配置和低延迟远程桌面项目。
+RemyDesk 是面向 Rockchip RK3588/RK3588S、RK3399 Linux 开发板的局域网文件桌面、Wi-Fi 配置和低延迟远程桌面项目。
 
 它由三个主要部分组成：
 
@@ -18,6 +18,7 @@ RemyDesk 是面向 RK3588/RK3588S Linux 开发板的局域网文件桌面、Wi-F
 - 1920x1080 默认输出，网络状况较差时可显式降到 1280x720
 - systemd 安装、诊断、升级和卸载
 - 通用 RK3588、Orange Pi 5 Plus、Firefly RK3588 配置档案
+- Firefly AIO-3399J ARM64 Docker/Compose 部署和 2–8 Mbps 自适应码率
 
 RemyDesk 不打包厂商内核、DTB、RGA、MPP或闭源GStreamer插件。目标板必须由其BSP提供匹配组件。
 
@@ -43,6 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/LMXZ1258/RemyDesk/main/scripts/inst
 ```bash
 sudo bash RemyDesk-RK3588-installer.sh --profile orangepi-5-plus
 sudo bash RemyDesk-RK3588-installer.sh --profile firefly-rk3588
+sudo bash RemyDesk-RK3588-installer.sh --allow-non-rk3588 --profile firefly-rk3399
 ```
 
 未知RK3588板卡使用 `generic-rk3588`。安装器会在目标板上编译C++、DRM、RGA和MPP组件，以匹配该板BSP；Release只预置与系统ABI无关的ARM64 Go程序。
@@ -82,6 +84,23 @@ sudo ./scripts/install.sh
 sudo ./scripts/install.sh --replace-landisk
 ```
 
+## AIO-3399J Docker部署
+
+Firefly AIO-3399J可以直接使用ARM64镜像：
+
+```bash
+sudo systemctl disable --now remydesk.service remydesk-desktop.service 2>/dev/null || true
+sudo docker compose -f compose.rk3399.yml up -d
+```
+
+默认镜像：
+
+```text
+ghcr.io/lmxz1258/remydesk:rk3399-latest
+```
+
+容器需要访问DRM、VPU、RGA、uinput和宿主机显示会话，因此Compose配置使用host网络和privileged模式。详细要求、数据目录、Xauthority及恢复systemd版本的方法见 [AIO-3399J Docker部署](docs/docker-rk3399.md)。
+
 ## 诊断与卸载
 
 ```bash
@@ -98,8 +117,8 @@ sudo ./scripts/uninstall.sh
 `VERSION` 是唯一版本来源。推送与其一致的标签会自动生成Release：
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 GitHub Actions会执行C++/Go测试、shell语法检查，并生成：
@@ -135,4 +154,3 @@ GitHub Actions会执行C++/Go测试、shell语法检查，并生成：
 ## 许可证
 
 RemyDesk使用MIT许可证。第三方组件见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-

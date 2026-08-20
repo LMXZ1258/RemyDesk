@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p /run/remydesk /var/lib/remydesk /srv/remydesk/data
+export REMYDESK_CONTAINER_INIT_PID="$$"
+
+cleanup() {
+  /opt/remydesk/bin/remydesk-container-service stop "${REMYDESK_DESKTOP_SERVICE:-remydesk-desktop.service}" || true
+  if [[ -n "${control_pid:-}" ]] && kill -0 "$control_pid" 2>/dev/null; then
+    kill -TERM "$control_pid" 2>/dev/null || true
+    wait "$control_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+case "${REMYDESK_DESKTOP_AUTOSTART:-1}" in
+  1|true|yes|on|enabled)
+    /opt/remydesk/bin/remydesk-container-service start "${REMYDESK_DESKTOP_SERVICE:-remydesk-desktop.service}"
+    ;;
+esac
+
+/opt/remydesk/bin/remydeskd &
+control_pid="$!"
+wait "$control_pid"

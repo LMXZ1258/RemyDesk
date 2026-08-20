@@ -5,6 +5,11 @@ LDLIBS_DRM += $(shell pkg-config --libs libdrm 2>/dev/null)
 LDLIBS_RGA += $(shell pkg-config --libs librga 2>/dev/null)
 LDLIBS_MPP += $(shell pkg-config --libs rockchip_mpp 2>/dev/null)
 
+ifneq ($(strip $(RK3399_RGA_ROOT)),)
+CPPFLAGS += -I$(RK3399_RGA_ROOT)/include -DREMYDESK_RGA_LEGACY_API=1
+LDLIBS_RGA := $(RK3399_RGA_ROOT)/librga.so.2
+endif
+
 all: drm_fb_probe drm_rga_snapshot drm_rga_mpp_frame drm_rga_mpp_stream
 
 drm_fb_probe: drm_fb_probe.c

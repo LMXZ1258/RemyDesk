@@ -12,6 +12,7 @@ find_package(Threads REQUIRED)
 add_executable(remydeskd
     src/core/main.cpp
     src/core/config.cpp
+    src/core/download_manager.cpp
     src/core/file_service.cpp
     src/core/hardware_probe.cpp
     src/core/http_server.cpp
@@ -20,6 +21,7 @@ add_executable(remydeskd
     src/core/service_manager.cpp
 )
 target_include_directories(remydeskd PRIVATE src/core third_party)
+target_compile_definitions(remydeskd PRIVATE REMYDESK_VERSION="${REMYDESK_VERSION}")
 target_compile_options(remydeskd PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(remydeskd PRIVATE Threads::Threads)
 

@@ -46,6 +46,10 @@ GO_BIN="$(find_go)" || {
   exit 1
 }
 
+if [[ ! -f "$ROOT/third_party/librga/rk3399/librga.so.2" ]]; then
+  "$ROOT/scripts/fetch-rk3399-librga.sh"
+fi
+
 mkdir -p "$STAGE/$NAME/native/webrtc-publisher"
 tar -C "$PARENT" \
   --exclude="$NAME/.git" \
@@ -64,7 +68,8 @@ tar -C "$PARENT" \
 (
   cd "$ROOT/native/webrtc-publisher"
   CGO_ENABLED=0 "$GO_BIN" test ./...
-  CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath -ldflags "-s -w" \
+  CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "$GO_BIN" build -trimpath \
+    -ldflags "-s -w -X main.version=$VERSION" \
     -o "$STAGE/$NAME/native/webrtc-publisher/remydesk-webrtc-publisher" .
 )
 chmod 0755 "$STAGE/$NAME/native/webrtc-publisher/remydesk-webrtc-publisher"
@@ -102,7 +107,7 @@ Options:
   --profile NAME        Select generic-rk3588 or a board profile
   --apply-profile       Reapply profile defaults during an upgrade
   --verify-only         Verify and extract-test the embedded payload only
-  --allow-non-rk3588    Allow installation on another ARM64 Rockchip SoC
+  --allow-non-rk3588    Allow installation on an unrecognized ARM64 Rockchip SoC
   -h, --help            Show this help
 USAGE
 }
@@ -142,8 +147,9 @@ COMPATIBLE=""
 if [[ -r /proc/device-tree/compatible ]]; then
   COMPATIBLE="\$(tr '\0' '\n' </proc/device-tree/compatible | paste -sd, -)"
 fi
-if [[ "\$VERIFY_ONLY" -ne 1 && "\$ALLOW_NON_RK3588" -ne 1 && "\$COMPATIBLE" != *rk3588* ]]; then
-  echo "This does not appear to be an RK3588 board: \${COMPATIBLE:-unknown compatible string}" >&2
+if [[ "\$VERIFY_ONLY" -ne 1 && "\$ALLOW_NON_RK3588" -ne 1 &&
+      "\$COMPATIBLE" != *rk3588* && "\$COMPATIBLE" != *rk3399* ]]; then
+  echo "This does not appear to be a supported RK3588/RK3399 board: \${COMPATIBLE:-unknown compatible string}" >&2
   echo "Use --allow-non-rk3588 only if the board has compatible Rockchip DRM/RGA/MPP support." >&2
   exit 1
 fi
@@ -209,7 +215,7 @@ for plugin in rawvideoparse h264parse mpph264enc; do
   gst-inspect-1.0 "\$plugin" >/dev/null 2>&1 || MISSING+=("gstreamer:\$plugin")
 done
 if (( \${#MISSING[@]} )); then
-  printf 'Missing RK3588 build/runtime capability: %s\n' "\${MISSING[@]}" >&2
+  printf 'Missing Rockchip build/runtime capability: %s\n' "\${MISSING[@]}" >&2
   echo "The board BSP must provide matching librga, Rockchip MPP and the GStreamer MPP plugin." >&2
   echo "See docs/portability.md in the bundled source for board-specific package guidance." >&2
   exit 1

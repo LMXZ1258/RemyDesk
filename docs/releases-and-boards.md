@@ -1,8 +1,8 @@
-# Release与RK3588板卡适配
+# Release与Rockchip板卡适配
 
 ## Release为什么仍要在目标板编译
 
-RK3588只描述SoC，不能保证不同厂商镜像拥有相同的RGA、MPP、GStreamer和DRM ABI。直接发布一套动态链接二进制，可能在另一块板上出现：
+SoC型号不能保证不同厂商镜像拥有相同的RGA、MPP、GStreamer和DRM ABI。直接发布一套动态链接二进制，可能在另一块板上出现：
 
 - 找不到 `librga.so` 或 `librockchip_mpp.so`
 - 结构体/像素格式/stride约定不一致
@@ -19,7 +19,7 @@ RK3588只描述SoC，不能保证不同厂商镜像拥有相同的RGA、MPP、GS
 ## 板卡支持等级
 
 - `validated`：在指定板卡和镜像完成安装、Web API、DRM捕获、硬解码验证。
-- `portable-baseline`：符合RK3588能力假设，但未承诺特定BSP的零拷贝。
+- `portable-baseline`：符合目标 Rockchip SoC 的能力假设，但未承诺特定BSP的零拷贝。
 - `needs-device-validation`：已有保守默认配置，必须在实机验收。
 
 支持等级记录在 `profiles/*/profile.conf`。
@@ -51,4 +51,3 @@ sudo /opt/remydesk/libexec/remydesk-doctor.sh --video
 4. 创建相同版本标签，例如 `v0.2.0`。
 5. Release工作流自动上传安装器、源码包和SHA256。
 6. 在新板先执行安装器 `--verify-only`，再正式安装。
-

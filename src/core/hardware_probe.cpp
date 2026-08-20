@@ -72,6 +72,11 @@ json probeHardware() {
     uname(&system);
     const std::string model = readText("/proc/device-tree/model");
     const std::string compatible = readText("/proc/device-tree/compatible");
+    const bool rk3399 = model.find("RK3399") != std::string::npos ||
+                        model.find("3399J") != std::string::npos ||
+                        compatible.find("rk3399") != std::string::npos;
+    const bool rk3588 = model.find("RK3588") != std::string::npos ||
+                        compatible.find("rk3588") != std::string::npos;
     return {
         {"schema", 1},
         {"system", {
@@ -82,7 +87,9 @@ json probeHardware() {
         {"board", {
             {"model", model},
             {"compatible", compatible},
-            {"rk3588", model.find("RK3588") != std::string::npos || compatible.find("rk3588") != std::string::npos},
+            {"soc", rk3399 ? "rk3399" : (rk3588 ? "rk3588" : "unknown")},
+            {"rk3399", rk3399},
+            {"rk3588", rk3588},
         }},
         {"drm", drmProbe()},
         {"media", {

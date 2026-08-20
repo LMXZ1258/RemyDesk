@@ -90,7 +90,7 @@ if [[ "${REMYDESK_SKIP_BUILD:-0}" == "1" ]]; then
     [[ -x "$artifact" ]] || { echo "missing prebuilt artifact: $artifact" >&2; exit 1; }
   done
 else
-  "$ROOT/scripts/build.sh"
+  REMYDESK_BUILD_PROFILE="$PROFILE" "$ROOT/scripts/build.sh"
 fi
 
 getent group remydesk >/dev/null || groupadd --system remydesk
@@ -113,6 +113,18 @@ install -m 0755 "$ROOT/native/desktop-streamer/portable_h264_stream.sh" "$PREFIX
 install -m 0755 "$ROOT/scripts/remydesk-display-mode.sh" "$PREFIX/libexec/remydesk-display-mode.sh"
 install -m 0755 "$ROOT/scripts/remydesk-doctor.sh" "$PREFIX/libexec/remydesk-doctor.sh"
 install -m 0755 "$ROOT/scripts/detect-profile.sh" "$PREFIX/libexec/detect-profile.sh"
+if [[ "$PROFILE" == "firefly-rk3399" ]]; then
+  RK3399_RGA="$ROOT/third_party/librga/rk3399/librga.so.2"
+  if [[ ! -f "$RK3399_RGA" ]]; then
+    "$ROOT/scripts/fetch-rk3399-librga.sh" "$RK3399_RGA"
+  fi
+  printf '%s  %s\n' \
+    3da1413445885420abf00821640ec8a37289ec176fe4ffeee0de5f68418ed50e \
+    "$RK3399_RGA" | sha256sum -c -
+  install -d -m 0755 "$PREFIX/lib/rga-rk3399"
+  install -m 0755 "$RK3399_RGA" "$PREFIX/lib/rga-rk3399/librga.so.2"
+  ln -sfn librga.so.2 "$PREFIX/lib/rga-rk3399/librga.so"
+fi
 install -d -m 0755 "$PREFIX/share/profiles"
 cp -a "$ROOT/profiles/." "$PREFIX/share/profiles/"
 cp -a "$ROOT/web/." "$PREFIX/share/web/"
@@ -173,6 +185,9 @@ ensure_desktop_default HDMI_XRANDR_OUTPUT auto
 ensure_desktop_default HDMI_XRANDR_RATE 60
 ensure_desktop_default HDMI_DISPLAY :0
 ensure_desktop_default HDMI_XAUTHORITY auto
+ensure_desktop_default REMYDESK_DRM_FORCE_CONNECTOR 0
+ensure_desktop_default REMYDESK_DRM_CONNECTOR_STATUS auto
+ensure_desktop_default REMYDESK_DRM_CONNECTOR_SETTLE_SECONDS 2
 chown root:remydesk /etc/remydesk/remydesk.env
 chown root:remydesk /etc/remydesk/desktop.env
 chmod 0640 /etc/remydesk/remydesk.env /etc/remydesk/desktop.env

@@ -8,10 +8,54 @@ DISPLAY_NAME="${HDMI_DISPLAY:-:0}"
 AUTHORITY="${HDMI_XAUTHORITY:-auto}"
 WAIT_SECONDS="${HDMI_MODE_WAIT_SECONDS:-30}"
 FORCE_MODE="${HDMI_FORCE_MODE:-1}"
+FORCE_CONNECTOR="${REMYDESK_DRM_FORCE_CONNECTOR:-0}"
+CONNECTOR_STATUS="${REMYDESK_DRM_CONNECTOR_STATUS:-auto}"
+CONNECTOR_SETTLE_SECONDS="${REMYDESK_DRM_CONNECTOR_SETTLE_SECONDS:-2}"
 
 log() {
   echo "remydesk-display: $*" >&2
 }
+
+force_drm_connector() {
+  [[ "$FORCE_CONNECTOR" != "0" ]] || return 0
+  if [[ "$EUID" -ne 0 ]]; then
+    log "DRM connector forcing requires root"
+    return 1
+  fi
+
+  local -a candidates=()
+  local status current
+  if [[ "$CONNECTOR_STATUS" != "auto" ]]; then
+    candidates+=("$CONNECTOR_STATUS")
+  else
+    shopt -s nullglob
+    candidates=(/sys/class/drm/card*-HDMI-A-*/status)
+    shopt -u nullglob
+  fi
+
+  for status in "${candidates[@]}"; do
+    [[ -r "$status" ]] || continue
+    current="$(<"$status")"
+    if [[ "$current" == "connected" ]]; then
+      log "DRM connector already connected: $status"
+      return 0
+    fi
+    [[ -w "$status" ]] || continue
+    if printf '%s\n' on >"$status" 2>/dev/null; then
+      sleep "$CONNECTOR_SETTLE_SECONDS"
+      current="$(<"$status")"
+      if [[ "$current" == "connected" ]]; then
+        log "forced DRM connector on: $status"
+        return 0
+      fi
+    fi
+  done
+
+  log "unable to force an HDMI DRM connector"
+  return 1
+}
+
+force_drm_connector || true
 
 if [[ "$FORCE_MODE" == "0" || "$MODE" == "auto" ]]; then
   log "mode forcing disabled"

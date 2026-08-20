@@ -10,6 +10,7 @@
 | 进程执行 | `src/core/process.*` | `fork/execvp`、stdout/stderr 收集、超时和信号终止 |
 | 文件服务 | `src/core/file_service.*` | 存储根目录约束、目录操作、便签 |
 | HTTP | `src/core/http_server.*` | 静态资源、JSON API、流式上传下载、Basic Auth |
+| 下载队列 | `src/core/download_manager.*` | 校验 HTTP(S) 链接，以单工作线程 FIFO 下载并原子写入文件根目录 |
 | 网络 | `src/core/network_manager.*` | 通过结构化参数调用 `nmcli`，处理扫描、连接、热点和 IPv4 |
 | 服务 | `src/core/service_manager.*` | 只允许桌面服务开关与系统关机 |
 | 探测 | `src/core/hardware_probe.*` | 设备树、DRM connector、RGA/MPP/DRM 运行条件 |
@@ -28,6 +29,7 @@
 
 上传由 `cpp-httplib::ContentReader` 分块接收，先写 `.uploading.*` 临时文件，成功后使用 rename 原子替换目标。
 下载使用文件 content provider，不会把大文件整体读入内存。
+链接下载器通过参数数组调用 `curl`，不经过 shell；任务使用隐藏临时文件，成功后才改名为可见文件。
 
 桌面图标布局以归一化坐标保存到 `/var/lib/remydesk/desktop-layout.json`，不依赖浏览器 profile 或
 `localStorage`，所以板卡重启、浏览器重启和不同窗口尺寸下都能恢复相对位置。文件拖放移动调用 `/api/move`，

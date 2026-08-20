@@ -4,6 +4,7 @@
 #include <string>
 
 #include "config.hpp"
+#include "download_manager.hpp"
 #include "file_service.hpp"
 #include "httplib.h"
 #include "network_manager.hpp"
@@ -20,6 +21,7 @@ public:
 private:
     Config config_;
     FileService files_;
+    DownloadManager downloads_;
     NetworkManager network_;
     ServiceManager services_;
     httplib::Server server_;

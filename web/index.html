@@ -19,6 +19,7 @@
       <button class="icon-button" id="backButton" title="返回上级" aria-label="返回上级"><i data-lucide="arrow-left"></i></button>
       <div id="breadcrumb" class="breadcrumb">/</div>
       <button class="command-button" id="mkdirButton"><i data-lucide="folder-plus"></i><span>新建文件夹</span></button>
+      <button class="command-button" id="downloaderButton"><i data-lucide="download-cloud"></i><span>下载器</span></button>
       <button class="command-button primary" id="uploadButton"><i data-lucide="upload"></i><span>上传</span></button>
       <input id="fileInput" type="file" multiple hidden>
     </section>
@@ -112,6 +113,17 @@
       <button id="copyNote" class="command-button"><i data-lucide="copy"></i><span>一键复制</span></button>
       <button id="saveNote" class="command-button primary"><i data-lucide="save"></i><span>保存</span></button>
     </div>
+  </dialog>
+
+  <dialog id="downloaderDialog" class="modal downloader-modal">
+    <div class="modal-head"><h2>链接下载器</h2><button class="icon-button close-dialog" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <form id="downloadForm" class="download-form">
+      <label class="field"><span>HTTP / HTTPS 下载链接</span><input id="downloadUrl" type="url" inputmode="url" autocomplete="off" placeholder="https://example.com/file.zip" required></label>
+      <button id="addDownload" class="command-button primary" type="submit"><i data-lucide="list-plus"></i><span>加入队列</span></button>
+    </form>
+    <p class="download-hint">任务按加入顺序逐个下载；完成后文件会出现在文件管理器根目录。</p>
+    <div id="downloadList" class="download-list" aria-live="polite"></div>
+    <div id="downloadEmpty" class="download-empty">还没有下载任务</div>
   </dialog>
 
   <dialog id="desktopDialog" class="desktop-modal">

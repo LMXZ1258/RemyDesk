@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -16,9 +17,9 @@ struct CommandResult {
 
 CommandResult runCommand(
     const std::vector<std::string> &arguments,
-    std::chrono::milliseconds timeout = std::chrono::seconds(15));
+    std::chrono::milliseconds timeout = std::chrono::seconds(15),
+    const std::atomic_bool *cancel = nullptr);
 
 std::string trim(std::string value);
 
 }  // namespace remydesk
-

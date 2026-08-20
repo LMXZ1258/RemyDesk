@@ -8,9 +8,13 @@ FPS="${REMYDESK_VIDEO_FPS:-30}"
 BITRATE="${REMYDESK_VIDEO_BITRATE:-6000000}"
 OUTPUT_WIDTH="${REMYDESK_VIDEO_WIDTH:-${REMYDESK_SOFTWARE_WIDTH:-1280}}"
 OUTPUT_HEIGHT="${REMYDESK_VIDEO_HEIGHT:-${REMYDESK_SOFTWARE_HEIGHT:-720}}"
+H264_PROFILE="${REMYDESK_H264_PROFILE:-baseline}"
+H264_LEVEL="${REMYDESK_H264_LEVEL:-40}"
+H264_CABAC="${REMYDESK_H264_CABAC:-0}"
 PROBE_SECONDS="${REMYDESK_VIDEO_PROBE_SECONDS:-2}"
 MPP_ZERO_COPY_PACKET="${REMYDESK_MPP_ZERO_COPY_PACKET:-false}"
 MPP_RUNTIME_USER="${REMYDESK_MPP_USER:-remydesk}"
+NATIVE_MPP_ZERO_COPY="${REMYDESK_NATIVE_MPP_ZERO_COPY:-0}"
 CACHE_FILE="${REMYDESK_VIDEO_CACHE_FILE:-/run/remydesk/video-backend-v2}"
 PROBE_ONLY=0
 
@@ -84,8 +88,8 @@ build_mpp_encoder() {
     "bps-min=$((BITRATE * 2 / 3))"
     "bps-max=$((BITRATE * 4 / 3))"
     "gop=$FPS"
-    profile=baseline
-    level=40
+    "profile=$H264_PROFILE"
+    "level=$H264_LEVEL"
   )
   if gst_has_property mpph264enc header-mode; then
     MPP_ENCODER+=(header-mode=each-idr)
@@ -308,9 +312,9 @@ run_ffmpeg_software() {
     -f kmsgrab -device "$DRM_DEVICE" -framerate "$FPS" -i - \
     -vf "hwdownload,format=bgr0,scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:flags=fast_bilinear,format=yuv420p" \
     -an -c:v libx264 -preset ultrafast -tune zerolatency \
-    -profile:v baseline -level 4.0 -g "$FPS" -keyint_min "$FPS" -sc_threshold 0 \
+    -profile:v "$H264_PROFILE" -level "${H264_LEVEL:0:1}.${H264_LEVEL:1}" -g "$FPS" -keyint_min "$FPS" -sc_threshold 0 \
     -b:v "$BITRATE" -maxrate "$BITRATE" -bufsize "$((BITRATE / 4))" \
-    -x264-params sliced-threads=0:sync-lookahead=0:rc-lookahead=0 \
+    -x264-params "sliced-threads=0:sync-lookahead=0:rc-lookahead=0:cabac=$H264_CABAC" \
     -flush_packets 1 -f h264 -
 }
 
@@ -319,12 +323,24 @@ run_native_mpp() {
     log "native MPP backend is unavailable"
     exit 1
   }
-  log "backend=native-mpp status=experimental fps=$FPS bitrate=$BITRATE"
-  exec ./drm_hotplug_stream.sh \
-    -f "$FPS" -b "$BITRATE" \
-    --color default --yuv nv12 \
-    --h264-profile baseline --h264-level 40 --h264-cabac 0 \
-    --cpu-stage --no-cursor
+  local native_args=(
+    -f "$FPS" -b "$BITRATE"
+    --out-width "$OUTPUT_WIDTH" --out-height "$OUTPUT_HEIGHT"
+    --color default --yuv nv12
+    --h264-profile "$H264_PROFILE" --h264-level "$H264_LEVEL" --h264-cabac "$H264_CABAC"
+    --no-cursor
+  )
+  if [[ "$NATIVE_MPP_ZERO_COPY" == "0" ]]; then
+    native_args+=(--cpu-stage)
+  fi
+  if [[ "${REMYDESK_NATIVE_WAIT_VBLANK:-1}" == "0" ]]; then
+    native_args+=(--no-wait-vblank)
+  fi
+  if [[ -n "${REMYDESK_NATIVE_BUFFER_COUNT:-}" ]]; then
+    native_args+=(--buffer-count "$REMYDESK_NATIVE_BUFFER_COUNT")
+  fi
+  log "backend=native-mpp zero_copy=$NATIVE_MPP_ZERO_COPY fps=$FPS bitrate=$BITRATE h264=$H264_PROFILE/$H264_LEVEL cabac=$H264_CABAC"
+  exec ./drm_hotplug_stream.sh "${native_args[@]}"
 }
 
 cache_backend() {

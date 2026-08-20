@@ -283,6 +283,44 @@ dialog::backdrop { background: rgba(2,6,9,.78); }
 .align-right { margin: 14px 0 0 auto; display: flex; }
 .note-text { min-height: 260px; resize: vertical; }
 .note-actions { margin-top: 14px; display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.downloader-modal { width: min(720px, calc(100vw - 24px)); }
+.download-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 9px;
+}
+.download-form .command-button { min-height: 41px; }
+.download-hint {
+  margin: 10px 2px 15px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.download-list { display: grid; gap: 7px; max-height: min(430px, 52dvh); overflow: auto; }
+.download-task {
+  min-width: 0;
+  padding: 10px 11px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.download-task-icon { color: #8fa3b1; display: grid; place-items: center; }
+.download-task-icon svg { width: 21px; height: 21px; }
+.download-task.status-running .download-task-icon { color: #79d6b4; }
+.download-task.status-running .download-task-icon svg { animation: download-spin .9s linear infinite; }
+.download-task.status-completed .download-task-icon { color: #79d6a6; }
+.download-task.status-failed .download-task-icon { color: #ef8c85; }
+.download-task-detail { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.download-task-detail strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.download-task-detail small { color: var(--muted); font-size: 12px; }
+.download-task-detail .download-task-error { color: #efaaa4; overflow-wrap: anywhere; }
+.download-empty { padding: 34px 12px; color: var(--muted); text-align: center; }
+@keyframes download-spin { to { transform: rotate(360deg); } }
 .desktop-modal { width: min(1500px, calc(100vw - 18px)); height: min(920px, calc(100dvh - 18px)); padding: 0; border: 1px solid var(--line); border-radius: var(--radius); background: #090d10; overflow: hidden; }
 .desktop-head { height: 54px; padding: 8px 10px 8px 16px; border-bottom: 1px solid var(--line); background: #111820; }
 .desktop-head > div { display: flex; gap: 7px; }
@@ -622,6 +660,7 @@ html.preview-fullscreen-active body { width: 100%; height: 100%; overflow: hidde
   .file-toolbar { flex-wrap: wrap; }
   .breadcrumb { order: 0; }
   .file-toolbar .command-button { flex: 1; }
+  .download-form { grid-template-columns: 1fr; }
   .file-head, .file-row { grid-template-columns: minmax(0, 1fr) 64px 38px; gap: 6px; }
   .dock { width: calc(100vw - 16px); justify-content: space-around; bottom: max(8px, env(safe-area-inset-bottom)); }
   .dock-button { min-width: 0; flex: 1; padding-inline: 4px; }
